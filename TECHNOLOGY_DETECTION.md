@@ -33,7 +33,7 @@ main.py               → Detects Python frameworks
 
 ### Basic API Call
 ```bash
-curl -X POST http://localhost:8000/api/analyze \
+curl -X POST http://https://gitpreview-ai-backend.onrender.com/api/analyze \
   -H "Content-Type: application/json" \
   -d '{"repoUrl": "https://github.com/facebook/react"}'
 ```

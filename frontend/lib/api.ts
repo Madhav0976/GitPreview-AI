@@ -1,6 +1,6 @@
 import type { AnalyzeRequest, AnalysisResponse } from './types'
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api'
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'https://gitpreview-ai-backend.onrender.com/api'
 
 export async function analyzeRepo(payload: AnalyzeRequest): Promise<AnalysisResponse> {
   const response = await fetch(`${API_BASE}/analyze`, {

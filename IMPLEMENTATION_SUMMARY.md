@@ -211,7 +211,7 @@ To use the feature:
 
 3. **Test Endpoint**:
    ```bash
-   curl -X POST http://localhost:8000/api/analyze \
+   curl -X POST http://https://gitpreview-ai-backend.onrender.com/api/analyze \
      -H "Content-Type: application/json" \
      -d '{"repoUrl": "https://github.com/facebook/react"}'
    ```

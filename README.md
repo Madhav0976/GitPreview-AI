@@ -242,7 +242,7 @@ uvicorn app.main:app --reload
 Backend will start at:
 
 ```text
-http://localhost:8000
+https://gitpreview-ai-backend.onrender.com
 ```
 
 ---
@@ -298,7 +298,7 @@ backend/.env
 ```
 
 ```env
-GITHUB_TOKEN=your_github_personal_access_token
+GITHUB_TOKEN=your_github_token_here
 ```
 
 ## Frontend
@@ -310,7 +310,7 @@ frontend/.env.local
 ```
 
 ```env
-NEXT_PUBLIC_API_URL=http://localhost:8000
+NEXT_PUBLIC_API_URL=https://gitpreview-ai-backend.onrender.com
 ```
 
 ---
@@ -397,7 +397,7 @@ gitpreview-ai/
 ## Base URL
 
 ```text
-http://localhost:8000
+https://gitpreview-ai-backend.onrender.com
 ```
 
 ### Analyze Repository

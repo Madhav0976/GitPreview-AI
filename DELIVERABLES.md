@@ -127,7 +127,7 @@ python -m uvicorn app.main:app --reload --port 8000
 
 ### 3. Test API
 ```bash
-curl -X POST http://localhost:8000/api/analyze \
+curl -X POST http://https://gitpreview-ai-backend.onrender.com/api/analyze \
   -H "Content-Type: application/json" \
   -d '{"repoUrl": "https://github.com/facebook/react"}'
 ```
