@@ -24,6 +24,18 @@ Analyze repository structure, detect technologies, discover entry points, and ge
 
 ---
 
+# 🌐 Live Demo
+
+### Frontend
+
+https://git-preview-ai.vercel.app
+
+### Backend API
+
+https://gitpreview-ai-backend.onrender.com
+
+---
+
 ## 📖 Project Description
 
 **GitPreview AI** is an intelligent repository analysis platform that helps developers quickly understand unfamiliar GitHub repositories.
@@ -518,6 +530,10 @@ pytest
 * **LinkedIn:** [in/madhavtanguturi](https://www.linkedin.com/in/madhavtanguturi)
 
 ---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](https://github.com/Madhav0976/GitPreview-AI/blob/main/LICENSE) file for details.
 
 <div align="center">
 
