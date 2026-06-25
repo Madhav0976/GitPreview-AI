@@ -59,7 +59,7 @@ async def analyze(request: AnalyzeRequest):
         metadata_dict["projectType"] = project_type
 
         # Generate Summary
-        desc = metadata_dict.get("description", "").strip()
+        desc = (metadata_dict.get("description") or "").strip()
         tech_list = metadata_dict.get("technologies", [])
         folders = folder_analysis_data.get("folderSummary", [])
         
