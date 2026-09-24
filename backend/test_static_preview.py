@@ -83,6 +83,11 @@ class TestPathValidationAndSecurity(unittest.TestCase):
         self.assertEqual(sanitize_and_validate_path("index.html", self.tree_paths), "index.html")
         self.assertEqual(sanitize_and_validate_path("css/style.css", self.tree_paths), "css/style.css")
         self.assertEqual(sanitize_and_validate_path("images/logo.png", self.tree_paths), "images/logo.png")
+        tree_with_gif = {"index.html", "styles.css", "forkit.gif", "images/my logo.png"}
+        self.assertEqual(sanitize_and_validate_path("forkit.gif", tree_with_gif), "forkit.gif")
+        self.assertEqual(sanitize_and_validate_path("FORKIT.GIF", tree_with_gif), "forkit.gif")
+        self.assertEqual(sanitize_and_validate_path("images/my%20logo.png", tree_with_gif), "images/my logo.png")
+        self.assertEqual(sanitize_and_validate_path("styles.css?v=2.1#top", tree_with_gif), "styles.css")
 
     def test_path_traversal_rejection(self):
         invalid_traversals = [
@@ -263,8 +268,60 @@ class TestPreviewAPIEndpoints(unittest.TestCase):
         self.assertNotIn("x-frame-options", resp.headers)
         self.assertIn(b"Test", resp.content)
 
+    @patch("app.api.preview.analysis_cache.get_or_compute_by_key")
+    def test_serve_asset_css_success(self, mock_cache):
+        css_content = b"body { background: #fff; margin: 0; }"
+        mock_cache.return_value = {
+            "content": css_content,
+            "mime_type": "text/css; charset=utf-8",
+            "etag": '"css123"',
+        }
+
+        resp = self.client.get("/api/preview/mock/repo/main/styles.css")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/css", resp.headers.get("content-type", ""))
+        self.assertIn("nosniff", resp.headers.get("x-content-type-options", ""))
+        csp = resp.headers.get("content-security-policy", "")
+        self.assertIn("frame-ancestors", csp)
+        self.assertIn("https://git-preview-ai.vercel.app", csp)
+        self.assertNotIn("x-frame-options", resp.headers)
+        self.assertEqual(resp.content, css_content)
+
+    @patch("app.api.preview.analysis_cache.get_or_compute_by_key")
+    def test_serve_asset_gif_success(self, mock_cache):
+        # Valid GIF header bytes (GIF89a)
+        gif_bytes = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+        mock_cache.return_value = {
+            "content": gif_bytes,
+            "mime_type": "image/gif",
+            "etag": '"gif123"',
+        }
+
+        resp = self.client.get("/api/preview/mock/repo/main/forkit.gif")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("content-type"), "image/gif")
+        self.assertIn("nosniff", resp.headers.get("x-content-type-options", ""))
+        csp = resp.headers.get("content-security-policy", "")
+        self.assertIn("frame-ancestors", csp)
+        self.assertIn("https://git-preview-ai.vercel.app", csp)
+        self.assertNotIn("x-frame-options", resp.headers)
+        self.assertEqual(resp.content, gif_bytes)
+
+    @patch("app.api.preview.fetch_git_tree")
+    def test_serve_asset_missing_404(self, mock_tree):
+        mock_tree.return_value = [
+            {"path": "index.html", "type": "blob"},
+            {"path": "styles.css", "type": "blob"},
+        ]
+        resp = self.client.get("/api/preview/mock/repo/main/missing_asset.png")
+        self.assertEqual(resp.status_code, 404)
+
     def test_serve_asset_invalid_coordinates(self):
         resp = self.client.get("/api/preview/mock/repo/main/../traversal.html")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_serve_asset_traversal_gif_rejected(self):
+        resp = self.client.get("/api/preview/mock/repo/main/../forkit.gif")
         self.assertEqual(resp.status_code, 400)
 
 

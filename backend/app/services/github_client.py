@@ -294,7 +294,12 @@ async def fetch_file_bytes(
     Returns (bytes, etag) or (None, None) if not found.
     """
     import base64
-    api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{file_path}"
+    import urllib.parse
+
+    clean_file_path = file_path.lstrip("/")
+    encoded_path = urllib.parse.quote(clean_file_path)
+    encoded_ref = urllib.parse.quote(default_branch)
+    api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{encoded_path}?ref={encoded_ref}"
     try:
         response = await client.get(api_url)
         rate_limit_tracker.update_from_headers(response.headers)
@@ -306,7 +311,8 @@ async def fetch_file_bytes(
                 data = response.json()
                 if isinstance(data, dict):
                     if "content" in data and data.get("encoding") == "base64":
-                        return base64.b64decode(data["content"]), etag
+                        clean_base64 = data["content"].replace("\n", "").replace("\r", "")
+                        return base64.b64decode(clean_base64), etag
                     if data.get("type") == "file" and "download_url" in data:
                         download_resp = await client.get(data["download_url"])
                         rate_limit_tracker.update_from_headers(download_resp.headers)
@@ -318,7 +324,7 @@ async def fetch_file_bytes(
             return None, None
 
         if response.status_code in (403, 429):
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{default_branch}/{file_path}"
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{encoded_ref}/{encoded_path}"
             raw_response = await client.get(raw_url)
             if raw_response.status_code == 200:
                 return raw_response.content, raw_response.headers.get("etag")

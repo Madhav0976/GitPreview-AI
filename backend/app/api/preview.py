@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 
 from fastapi import APIRouter, HTTPException, Request, Response
 import httpx
@@ -139,9 +139,14 @@ async def serve_preview_asset(
         headers = get_github_headers()
 
         async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True, headers=headers) as client:
-            # Fetch git tree to verify existence and avoid 404 probes
-            tree_entries = await fetch_git_tree(owner, repo, branch, client)
-            tree_paths = {entry.get("path", "") for entry in tree_entries if entry.get("type") == "blob"}
+            # Fetch git tree to verify existence and avoid 404 probes (cached with analysis_cache)
+            tree_cache_key = f"git_tree_paths:{owner}/{repo}/{branch}"
+
+            async def _load_tree_paths() -> Set[str]:
+                entries = await fetch_git_tree(owner, repo, branch, client)
+                return {entry.get("path", "") for entry in entries if entry.get("type") == "blob"}
+
+            tree_paths = await analysis_cache.get_or_compute_by_key(tree_cache_key, _load_tree_paths)
 
             # Validate path, extension, and ensure it exists in tree
             clean_path = sanitize_and_validate_path(file_path, tree_paths)

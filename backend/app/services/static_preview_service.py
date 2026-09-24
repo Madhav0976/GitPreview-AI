@@ -11,6 +11,7 @@ import logging
 import os
 import posixpath
 import re
+import urllib.parse
 from typing import Dict, Any, List, Set, Optional, Tuple
 
 import httpx
@@ -37,17 +38,23 @@ STATIC_MIME_TYPES: Dict[str, str] = {
     ".js": "application/javascript; charset=utf-8",
     ".mjs": "application/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".gif": "image/gif",
     ".svg": "image/svg+xml",
     ".webp": "image/webp",
+    ".avif": "image/avif",
     ".ico": "image/x-icon",
+    ".bmp": "image/bmp",
     ".woff": "font/woff",
     ".woff2": "font/woff2",
     ".ttf": "font/ttf",
     ".otf": "font/otf",
+    ".eot": "application/vnd.ms-fontobject",
+    ".xml": "application/xml; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
 }
 
 # Blacklist of prohibited sensitive/server/executable extensions
@@ -234,12 +241,16 @@ def sanitize_and_validate_path(file_path: str, tree_paths: Set[str]) -> str:
     if not file_path or not isinstance(file_path, str):
         raise HTTPException(status_code=400, detail="Invalid file path.")
 
-    stripped = file_path.strip()
-    if stripped.startswith("/") or stripped.startswith("\\"):
+    # Strip query parameters (?v=1) and fragments (#hash)
+    raw_path = file_path.strip().split("?")[0].split("#")[0]
+    if raw_path.startswith("/") or raw_path.startswith("\\"):
         raise HTTPException(status_code=400, detail="Absolute paths are not allowed.")
 
+    # Decode URL-encoded characters (e.g. %20 -> space)
+    decoded = urllib.parse.unquote(raw_path)
+
     # Clean path and prevent directory traversal
-    clean_path = posixpath.normpath(stripped)
+    clean_path = posixpath.normpath(decoded)
 
     if clean_path.startswith("..") or "/../" in f"/{clean_path}/" or clean_path.startswith("/"):
         raise HTTPException(status_code=400, detail="Path traversal detected.")
@@ -254,9 +265,16 @@ def sanitize_and_validate_path(file_path: str, tree_paths: Set[str]) -> str:
     if ext not in STATIC_MIME_TYPES:
         raise HTTPException(status_code=403, detail=f"File extension '{ext}' is not supported for static preview.")
 
-    # Verify that the path actually exists in the Git tree
-    if clean_path not in tree_paths:
-        raise HTTPException(status_code=404, detail=f"File '{clean_path}' not found in repository.")
+    # Verify that the path exists in the Git tree (direct match)
+    if clean_path in tree_paths:
+        return clean_path
+
+    # Case-insensitive fallback match (e.g. styles.CSS vs styles.css)
+    lower_map = {p.lower(): p for p in tree_paths}
+    if clean_path.lower() in lower_map:
+        return lower_map[clean_path.lower()]
+
+    raise HTTPException(status_code=404, detail=f"File '{clean_path}' not found in repository.")
 
     return clean_path
 
