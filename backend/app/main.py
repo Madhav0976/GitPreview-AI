@@ -10,11 +10,12 @@ from slowapi.errors import RateLimitExceeded
 from app.limiter import limiter
 from app.api.health import router as health_router
 from app.api.analyze import router as analyze_router
+from app.api.run_analysis import router as run_analysis_router
 
 app = FastAPI(
     title="GitPreview AI Backend",
-    description="API for repository analysis and metadata preview.",
-    version="0.1.0",
+    description="API for repository analysis, metadata preview, and run analysis.",
+    version="0.2.0",
 )
 
 # Connect slowapi limiter
@@ -53,6 +54,7 @@ app.add_middleware(
 # API Routes
 app.include_router(health_router, prefix="/api")
 app.include_router(analyze_router, prefix="/api")
+app.include_router(run_analysis_router, prefix="/api")
 
 
 @app.get("/", tags=["root"])

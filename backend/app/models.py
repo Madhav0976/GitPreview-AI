@@ -1,4 +1,5 @@
-from pydantic import BaseModel, HttpUrl
+from enum import Enum
+from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, Dict, List
 
 
@@ -22,12 +23,60 @@ class RepositoryMetadata(BaseModel):
 
 
 class FolderAnalysis(BaseModel):
-    entryPoints: List[str] = []
-    importantFiles: List[str] = []
-    folderSummary: List[str] = []
+    entryPoints: List[str] = Field(default_factory=list)
+    importantFiles: List[str] = Field(default_factory=list)
+    folderSummary: List[str] = Field(default_factory=list)
 
 
 class AnalysisResponse(BaseModel):
     """Simplified response with repository metadata and folder analysis"""
     metadata: RepositoryMetadata
     folderAnalysis: FolderAnalysis = FolderAnalysis()
+
+
+# ==========================================
+# V2 Run Analysis Models
+# ==========================================
+
+class AppCategory(str, Enum):
+    STATIC = "static"
+    FRONTEND = "frontend"
+    BACKEND_API = "backend API"
+    FULL_STACK = "full-stack"
+    CLI = "cli"
+    LIBRARY = "library"
+    UNKNOWN = "unknown"
+
+
+class PreviewFeasibility(str, Enum):
+    READY = "READY"
+    NEEDS_ENV = "NEEDS_ENV"
+    NEEDS_EXTERNAL_SERVICE = "NEEDS_EXTERNAL_SERVICE"
+    UNSUPPORTED = "UNSUPPORTED"
+    UNKNOWN = "UNKNOWN"
+
+
+class RunAnalysisResult(BaseModel):
+    """How the repository could potentially be run and previewed"""
+    runtime: Optional[str] = None
+    packageManager: Optional[str] = None
+    installCommand: Optional[str] = None
+    buildCommand: Optional[str] = None
+    startCommand: Optional[str] = None
+    expectedPort: Optional[int] = None
+    requiredEnvVars: List[str] = Field(default_factory=list)
+    detectedEnvFiles: List[str] = Field(default_factory=list)
+    externalServices: List[str] = Field(default_factory=list)
+    category: str = AppCategory.UNKNOWN.value
+    feasibility: str = PreviewFeasibility.UNKNOWN.value
+    blockers: List[str] = Field(default_factory=list)
+    entryPoint: Optional[str] = None
+    workingDirectory: Optional[str] = None
+
+
+class RunAnalysisResponse(BaseModel):
+    """Complete V2 run analysis response"""
+    owner: str
+    repo: str
+    defaultBranch: str
+    analysis: RunAnalysisResult
