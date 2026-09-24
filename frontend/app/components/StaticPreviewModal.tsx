@@ -218,7 +218,7 @@ export default function StaticPreviewModal({
                 title={`Live Preview of ${repoName}`}
                 className="w-full h-full border-0 bg-white"
                 sandbox="allow-scripts allow-forms"
-                loading="lazy"
+                loading="eager"
                 referrerPolicy="no-referrer"
                 onLoad={() => setLoading(false)}
                 onError={() => {

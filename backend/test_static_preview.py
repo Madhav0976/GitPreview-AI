@@ -257,7 +257,10 @@ class TestPreviewAPIEndpoints(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn("text/html", resp.headers.get("content-type", ""))
         self.assertIn("nosniff", resp.headers.get("x-content-type-options", ""))
-        self.assertIn("frame-ancestors", resp.headers.get("content-security-policy", ""))
+        csp = resp.headers.get("content-security-policy", "")
+        self.assertIn("frame-ancestors", csp)
+        self.assertIn("https://git-preview-ai.vercel.app", csp)
+        self.assertNotIn("x-frame-options", resp.headers)
         self.assertIn(b"Test", resp.content)
 
     def test_serve_asset_invalid_coordinates(self):

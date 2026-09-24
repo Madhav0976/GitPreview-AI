@@ -190,11 +190,10 @@ async def serve_preview_asset(
         "Content-Security-Policy": (
             "default-src 'self' 'unsafe-inline' data: blob: https:; "
             "object-src 'none'; "
-            "frame-ancestors 'self' https://gitpreview-ai.vercel.app http://localhost:3000;"
+            "frame-ancestors 'self' https://git-preview-ai.vercel.app https://gitpreview-ai.vercel.app http://localhost:3000;"
         ),
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
-        "X-Frame-Options": "SAMEORIGIN",
         "Cache-Control": "public, max-age=1800",
     }
     if asset_data.get("etag"):
