@@ -2,9 +2,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
 
+from app.limiter import limiter
 from app.api.health import router as health_router
 from app.api.analyze import router as analyze_router
 
@@ -13,6 +16,25 @@ app = FastAPI(
     description="API for repository analysis and metadata preview.",
     version="0.1.0",
 )
+
+# Connect slowapi limiter
+app.state.limiter = limiter
+
+
+def rate_limit_custom_handler(request: Request, exc: RateLimitExceeded):
+    """Custom handler returning clear JSON error conforming to standard API detail schema."""
+    response = JSONResponse(
+        {"detail": f"Rate limit exceeded: {exc.detail}. Please try again later."},
+        status_code=429,
+    )
+    if hasattr(request.state, "view_rate_limit") and hasattr(request.app.state, "limiter"):
+        response = request.app.state.limiter._inject_headers(
+            response, request.state.view_rate_limit
+        )
+    return response
+
+
+app.add_exception_handler(RateLimitExceeded, rate_limit_custom_handler)
 
 # CORS Configuration
 app.add_middleware(

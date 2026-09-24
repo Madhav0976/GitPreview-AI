@@ -1,8 +1,12 @@
 import asyncio
+from dataclasses import dataclass
 import logging
 import os
+import re
+import threading
+import time
 from typing import Dict, Any, Tuple, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import httpx
 
@@ -10,6 +14,80 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API_BASE = "https://api.github.com/repos"
 TIMEOUT = 12
+
+# GitHub username/organization rules:
+# - Alphanumeric characters or single hyphens
+# - Cannot begin or end with a hyphen
+# - Max length 39 characters
+OWNER_REGEX = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$")
+
+# GitHub repository name rules:
+# - Alphanumeric characters, periods, hyphens, and underscores
+# - Max length 100 characters
+# - Cannot be '.' or '..'
+REPO_REGEX = re.compile(r"^[a-zA-Z0-9_.-]{1,100}$")
+
+VALID_GITHUB_HOSTS = {"github.com", "www.github.com"}
+
+
+@dataclass
+class GitHubRateLimitStatus:
+    limit: Optional[int] = None
+    remaining: Optional[int] = None
+    reset_timestamp: Optional[int] = None
+    last_updated: Optional[float] = None
+
+
+class RateLimitTracker:
+    """Thread-safe tracker for GitHub API quota usage based on response headers."""
+
+    def __init__(self):
+        self._status = GitHubRateLimitStatus()
+        self._lock = threading.Lock()
+
+    def update_from_headers(self, headers: Any) -> None:
+        """Extract rate limit headers and update status safely."""
+        if not headers:
+            return
+
+        limit_val = headers.get("x-ratelimit-limit")
+        remaining_val = headers.get("x-ratelimit-remaining")
+        reset_val = headers.get("x-ratelimit-reset")
+
+        if remaining_val is not None:
+            try:
+                remaining = int(remaining_val)
+                limit = int(limit_val) if limit_val is not None else None
+                reset = int(reset_val) if reset_val is not None else None
+
+                with self._lock:
+                    self._status.limit = limit
+                    self._status.remaining = remaining
+                    self._status.reset_timestamp = reset
+                    self._status.last_updated = time.time()
+
+                if remaining < 500:
+                    logger.warning(
+                        "GitHub API quota running low: %d remaining (limit: %s, reset: %s)",
+                        remaining,
+                        limit,
+                        reset,
+                    )
+            except (ValueError, TypeError):
+                pass
+
+    def get_status(self) -> Dict[str, Any]:
+        """Return safe, non-sensitive rate limit statistics."""
+        with self._lock:
+            return {
+                "limit": self._status.limit,
+                "remaining": self._status.remaining,
+                "reset_timestamp": self._status.reset_timestamp,
+                "last_updated": self._status.last_updated,
+            }
+
+
+rate_limit_tracker = RateLimitTracker()
 
 
 def get_github_headers() -> Dict[str, str]:
@@ -26,36 +104,95 @@ def get_github_headers() -> Dict[str, str]:
 
 def parse_repo_url(repo_url: str) -> Tuple[str, str]:
     """
-    Extract owner and repository name from GitHub URL.
-    Handles formats:
+    Strictly validate and extract owner and repository name from GitHub URL.
+
+    Accepts:
     - https://github.com/owner/repo
     - https://github.com/owner/repo.git
+    - http://github.com/owner/repo
     - git@github.com:owner/repo.git
+    - git@github.com:owner/repo
+    - Trailing slashes (e.g. https://github.com/owner/repo/)
+
+    Rejects:
+    - Host spoofing (evilgithub.com, github.com.evil.com, google.com)
+    - Extra path segments (/owner/repo/pull/1, /owner/repo/tree/main)
+    - Empty owner or empty repo
+    - Path traversal attempts (.., %2e%2e)
+    - Invalid characters in owner or repository name
     """
-    repo_url = repo_url.strip()
+    if not repo_url or not isinstance(repo_url, str):
+        raise ValueError("Repository URL must be a non-empty string.")
 
-    # Handle git@ SSH format
-    if repo_url.startswith("git@github.com:"):
-        parts = repo_url.replace("git@github.com:", "").replace(".git", "").split("/")
-        if len(parts) >= 2:
-            return parts[0], parts[1]
+    cleaned = repo_url.strip()
 
-    # Handle HTTPS format
-    parsed = urlparse(repo_url)
-    if parsed.hostname and "github.com" in parsed.hostname:
-        path = parsed.path.strip("/")
-        path = path.replace(".git", "")
-        parts = path.split("/")
-        if len(parts) >= 2:
-            return parts[0], parts[1]
+    # Reject traversal tokens before or after URL decoding
+    decoded = unquote(cleaned).lower()
+    if ".." in cleaned or ".." in decoded:
+        raise ValueError("Invalid GitHub repository URL: path traversal detected.")
 
-    raise ValueError(f"Invalid GitHub repository URL: {repo_url}")
+    owner = ""
+    repo_name = ""
+
+    # 1. Handle SSH format: git@github.com:owner/repo[.git]
+    if cleaned.startswith("git@github.com:"):
+        path_part = cleaned[len("git@github.com:"):].strip("/")
+        if path_part.endswith(".git"):
+            path_part = path_part[:-4]
+
+        parts = [p for p in path_part.split("/") if p]
+        if len(parts) != 2:
+            raise ValueError(f"Invalid GitHub repository URL path: expected 'owner/repo', got '{path_part}'")
+        owner, repo_name = parts[0], parts[1]
+
+    else:
+        # 2. Handle HTTP/HTTPS format
+        # Allow input without scheme like github.com/owner/repo
+        if cleaned.startswith("github.com/") or cleaned.startswith("www.github.com/"):
+            cleaned = "https://" + cleaned
+
+        try:
+            parsed = urlparse(cleaned)
+        except Exception:
+            raise ValueError(f"Malformed URL: {repo_url}")
+
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in VALID_GITHUB_HOSTS:
+            raise ValueError(f"Invalid GitHub repository host: '{hostname}'. Must be github.com.")
+
+        # Require exactly two non-empty path segments: owner and repo
+        raw_path = parsed.path.strip("/")
+        if raw_path.endswith(".git"):
+            raw_path = raw_path[:-4]
+
+        parts = [p for p in raw_path.split("/") if p]
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid GitHub repository URL path. Expected exactly 'owner/repo', got '{parsed.path}'."
+            )
+
+        owner, repo_name = parts[0], parts[1]
+
+    # Validate owner name
+    if not OWNER_REGEX.match(owner):
+        raise ValueError(
+            f"Invalid GitHub repository owner name: '{owner}'. Must follow GitHub username guidelines."
+        )
+
+    # Validate repository name
+    if not REPO_REGEX.match(repo_name) or repo_name in (".", ".."):
+        raise ValueError(
+            f"Invalid GitHub repository name: '{repo_name}'. Must follow GitHub repository naming rules."
+        )
+
+    return owner, repo_name
 
 
 async def fetch_repo_info(owner: str, repo_name: str, client: httpx.AsyncClient) -> Dict[str, Any]:
     """Fetch core repository metadata from GitHub REST API."""
     url = f"{GITHUB_API_BASE}/{owner}/{repo_name}"
     response = await client.get(url)
+    rate_limit_tracker.update_from_headers(response.headers)
     response.raise_for_status()
     return response.json()
 
@@ -65,6 +202,7 @@ async def fetch_languages(owner: str, repo_name: str, client: httpx.AsyncClient)
     url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/languages"
     try:
         response = await client.get(url)
+        rate_limit_tracker.update_from_headers(response.headers)
         if response.status_code == 200:
             return response.json() or {}
     except Exception as e:
@@ -85,6 +223,7 @@ async def fetch_git_tree(
     url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/git/trees/{branch}?recursive=1"
     try:
         response = await client.get(url)
+        rate_limit_tracker.update_from_headers(response.headers)
         if response.status_code == 200:
             data = response.json()
             if isinstance(data, dict) and "tree" in data:
@@ -112,6 +251,7 @@ async def fetch_file_content(
     api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{file_path}"
     try:
         response = await client.get(api_url)
+        rate_limit_tracker.update_from_headers(response.headers)
         if response.status_code == 200:
             content_type = response.headers.get("content-type", "")
             if content_type.startswith("application/json"):
@@ -122,6 +262,7 @@ async def fetch_file_content(
                         return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
                     if data.get("type") == "file" and "download_url" in data:
                         download_resp = await client.get(data["download_url"])
+                        rate_limit_tracker.update_from_headers(download_resp.headers)
                         if download_resp.status_code == 200:
                             return download_resp.text
                 return ""
@@ -178,4 +319,3 @@ async def fetch_repo_metadata(repo_url: str) -> Dict[str, Any]:
             "languages": languages_data,
             "technologies": technologies_list,
         }
-

@@ -1,0 +1,10 @@
+# Local env files
+.env.local
+.env*.local
+
+# Dependencies & Build
+node_modules/
+.next/
+dist/
+build/
+.DS_Store
