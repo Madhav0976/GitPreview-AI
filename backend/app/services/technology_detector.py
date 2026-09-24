@@ -1,22 +1,25 @@
 """
-Technology detection service that analyzes repository files to identify:
-- Frontend frameworks (React, Next.js, Vue, Angular, Vite)
-- Backend frameworks (Node.js, Express, FastAPI, Flask, Django)
-- Programming languages (JavaScript, TypeScript, Python, Java, C++, Go)
+Technology detection service that analyzes repository structure and key files to identify:
+- Frontend frameworks (React, Next.js, Vue, Angular, Vite, Svelte, Nuxt, Tailwind CSS)
+- Backend frameworks (Node.js, Express, FastAPI, Flask, Django, NestJS)
+- Programming languages (JavaScript, TypeScript, Python, Java, Go, Rust, PHP, Ruby, C#, Kotlin, C++)
+- Package managers and dev tooling (npm, Yarn, pnpm, Bun, Docker, Maven, Gradle)
 """
 import json
 import logging
 import os
+import re
+from typing import Set, Dict, Any, List, Optional
 import httpx
-from typing import Set, Dict, Any
+
+from app.services.github_client import get_github_headers, fetch_file_content
 
 logger = logging.getLogger(__name__)
 
 GITHUB_API_BASE = "https://api.github.com/repos"
-TIMEOUT = 10
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", None)
+TIMEOUT = 12
 
-# Files to fetch and analyze
+# Standard root files for fallback detection
 DETECTION_FILES = {
     "package.json": "detect_from_package_json",
     "requirements.txt": "detect_from_requirements_txt",
@@ -31,55 +34,20 @@ DETECTION_FILES = {
     "main.py": "detect_python_framework",
 }
 
-
-def get_github_headers() -> Dict[str, str]:
-    """Get headers for GitHub API requests."""
-    headers = {"Accept": "application/vnd.github.v3.raw"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    return headers
-
-
-async def list_repository_directory(
-    owner: str,
-    repo_name: str,
-    path: str,
-    client: httpx.AsyncClient,
-    default_branch: str = "main",
-) -> list[dict[str, Any]]:
-    """List the contents of a repository directory using the GitHub API."""
-    directory = path.strip("/")
-    url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{directory}"
-    try:
-        response = await client.get(url)
-        logger.debug("Listing %s/%s/%s => %s", owner, repo_name, directory or ".", response.status_code)
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, list):
-                return data
-
-        if response.status_code in {403, 404}:
-            logger.debug("Contents API failed for %s, falling back to git tree", url)
-            tree_url = (
-                f"{GITHUB_API_BASE}/{owner}/{repo_name}/git/trees/{default_branch}:{directory}"
-                if directory
-                else f"{GITHUB_API_BASE}/{owner}/{repo_name}/git/trees/{default_branch}"
-            )
-            tree_response = await client.get(tree_url)
-            if tree_response.status_code == 200:
-                tree_data = tree_response.json()
-                if isinstance(tree_data, dict) and "tree" in tree_data:
-                    entries = []
-                    for entry in tree_data["tree"]:
-                        if entry.get("path") and entry.get("type") in {"blob", "tree"}:
-                            entries.append({
-                                "name": entry["path"].split("/")[-1],
-                                "type": "dir" if entry["type"] == "tree" else "file",
-                            })
-                    return entries
-    except Exception:
-        logger.exception("Failed to list repository directory %s/%s/%s", owner, repo_name, directory)
-    return []
+IGNORED_PATH_SEGMENTS = {
+    "node_modules",
+    ".git",
+    "venv",
+    ".venv",
+    "env",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    "vendor",
+    ".nuxt",
+    ".cache",
+}
 
 
 def parse_workspaces_from_package_json(content: str) -> list[str]:
@@ -109,87 +77,21 @@ async def expand_workspace_package_paths(
         if pattern.endswith("/package.json"):
             package_paths.append(pattern)
             continue
-
         if pattern.endswith("/*"):
             directory = pattern[:-2].strip("/")
-            entries = await list_repository_directory(owner, repo_name, directory, client, default_branch="main")
-            for entry in entries:
-                if entry.get("type") == "dir":
-                    package_paths.append(f"{directory}/{entry['name']}/package.json")
-            continue
-
-        if "*" in pattern:
-            prefix = pattern.split("*")[0].strip("/")
-            entries = await list_repository_directory(owner, repo_name, prefix, client, default_branch="main")
-            for entry in entries:
-                if entry.get("type") == "dir":
-                    package_paths.append(f"{prefix}{entry['name']}/package.json")
+            package_paths.append(f"{directory}/package.json")
     return package_paths
 
 
-async def fetch_file_content(
-    owner: str,
-    repo_name: str,
-    file_path: str,
-    client: httpx.AsyncClient,
-    default_branch: str = "main",
-) -> str:
-    """Fetch file content from GitHub API, with raw.githubusercontent.com fallback."""
-    api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{file_path}"
-    try:
-        response = await client.get(api_url)
-        logger.debug("Fetching %s from %s/%s => %s", file_path, owner, repo_name, response.status_code)
-
-        if response.status_code == 200:
-            content_type = response.headers.get("content-type", "")
-            if content_type.startswith("application/json"):
-                data = response.json()
-                if isinstance(data, dict):
-                    if "content" in data and data.get("encoding") == "base64":
-                        import base64
-                        return base64.b64decode(data["content"]).decode("utf-8")
-                    if data.get("type") == "file" and "download_url" in data:
-                        download_response = await client.get(data["download_url"])
-                        if download_response.status_code == 200:
-                            return download_response.text
-                logger.debug("Unexpected JSON response for %s: %s", file_path, data)
-                return ""
-            if content_type.startswith("text/") or content_type == "application/octet-stream":
-                return response.text
-            try:
-                return response.text
-            except Exception:
-                pass
-        elif response.status_code == 404:
-            logger.debug("File not found: %s", file_path)
-        else:
-            logger.warning("Failed to fetch %s: %s %s", file_path, response.status_code, response.text[:200])
-
-        # Fallback to raw.githubusercontent.com for public repos when API access is blocked.
-        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{default_branch}/{file_path}"
-        logger.debug("Falling back to raw.githubusercontent.com for %s", file_path)
-        raw_response = await client.get(raw_url)
-        if raw_response.status_code == 200:
-            return raw_response.text
-        logger.warning(
-            "Raw fallback failed for %s: %s %s",
-            file_path,
-            raw_response.status_code,
-            raw_response.text[:200],
-        )
-    except Exception as exc:
-        logger.exception("Error fetching file %s for %s/%s", file_path, owner, repo_name)
-    return ""
-
-
 def detect_from_package_json(content: str) -> Set[str]:
-    """Detect technologies from package.json."""
+    """Detect technologies from package.json dependencies."""
     technologies = set()
     try:
         data = json.loads(content)
         deps = data.get("dependencies") or {}
         dev_deps = data.get("devDependencies") or {}
-        dependencies = {**deps, **dev_deps}
+        peer_deps = data.get("peerDependencies") or {}
+        dependencies = {**deps, **dev_deps, **peer_deps}
         package_name = str(data.get("name", "")).lower()
 
         # Frontend frameworks
@@ -197,16 +99,23 @@ def detect_from_package_json(content: str) -> Set[str]:
             technologies.add("React")
         if "next" in dependencies or package_name == "next":
             technologies.add("Next.js")
+            technologies.add("React")
         if "vue" in dependencies or package_name == "vue":
             technologies.add("Vue")
-        if "@angular/core" in dependencies or package_name == "angular" or package_name == "@angular/core":
+        if "@angular/core" in dependencies or package_name in ("angular", "@angular/core"):
             technologies.add("Angular")
+        if "svelte" in dependencies or "@sveltejs/kit" in dependencies or package_name == "svelte":
+            technologies.add("Svelte")
         if "vite" in dependencies or package_name == "vite":
             technologies.add("Vite")
+        if "tailwindcss" in dependencies:
+            technologies.add("Tailwind CSS")
 
         # Backend frameworks
         if "express" in dependencies or package_name == "express":
             technologies.add("Express")
+        if "@nestjs/core" in dependencies or package_name == "nest":
+            technologies.add("NestJS")
 
         # Languages
         if "typescript" in dependencies or "typescript" in dev_deps:
@@ -214,7 +123,7 @@ def detect_from_package_json(content: str) -> Set[str]:
         else:
             technologies.add("JavaScript")
 
-        # Node.js is implied if package.json exists
+        # Node.js is implied by package.json
         technologies.add("Node.js")
 
     except (json.JSONDecodeError, AttributeError, TypeError):
@@ -226,98 +135,92 @@ def detect_from_package_json(content: str) -> Set[str]:
 def detect_from_requirements_txt(content: str) -> Set[str]:
     """Detect technologies from requirements.txt."""
     technologies = set()
-    technologies.add("Python")  # requirements.txt implies Python
-    
+    technologies.add("Python")
     lines = content.lower().split("\n")
-    
+
     for line in lines:
-        line = line.strip().split("#")[0].strip()  # Remove comments
+        line = line.strip().split("#")[0].strip()
         if not line:
             continue
-        
-        # Extract package name (before version specifiers)
-        package_name = line.split("==")[0].split(">")[0].split("<")[0].split("!")[0].strip()
-        
+        package_name = line.split("==")[0].split(">")[0].split("<")[0].split("!")[0].split("~=")[0].strip()
+
         if package_name == "fastapi":
             technologies.add("FastAPI")
         elif package_name == "flask":
             technologies.add("Flask")
         elif package_name == "django":
             technologies.add("Django")
-    
+
     return technologies
 
 
-import re
-
 def _get_primary_deps_from_pyproject(content: str) -> str:
     """
-    Extract ONLY the primary [project] dependencies block from pyproject.toml,
-    ignoring [project.optional-dependencies], [tool.*], etc.
-    This prevents false positives from test/optional deps like flask in FastAPI.
+    Extract dependencies block from pyproject.toml:
+    supports standard [project.dependencies] (PEP 621) and [tool.poetry.dependencies] (Poetry).
     """
     primary_lines = []
     in_primary_deps = False
     in_project_block = False
-    
+    in_poetry_block = False
+
     for line in content.splitlines():
         stripped = line.strip().lower()
-        
-        # Detect section headers
+
         if stripped.startswith('['):
-            # Enter [project] block
             if stripped in ('[project]',):
                 in_project_block = True
+                in_poetry_block = False
                 in_primary_deps = False
-            # Inside [project], detect the dependencies array start
-            elif in_project_block and stripped == 'dependencies':
-                # This is an inline key, handled below
-                pass
-            else:
-                # Any other [section] exits the primary deps zone
+            elif stripped in ('[tool.poetry.dependencies]', '[tool.poetry.group.main.dependencies]'):
+                in_poetry_block = True
                 in_project_block = False
+                in_primary_deps = True
+                continue
+            else:
+                in_project_block = False
+                in_poetry_block = False
                 in_primary_deps = False
             continue
-        
-        # Look for 'dependencies = [' inside [project] block only
+
+        if in_poetry_block:
+            primary_lines.append(line)
+            continue
+
         if in_project_block and re.match(r'^dependencies\s*=', stripped):
             in_primary_deps = True
-        
-        # Collect lines only while inside primary dependencies
+
         if in_primary_deps:
             primary_lines.append(line)
-            # End of deps list
             if ']' in line and line.strip() != 'dependencies = [':
                 in_primary_deps = False
-    
-    # Also capture name = "..." from [project] section for the repo's own identity
-    name_match = re.search(r'^\[project\].*?^name\s*=\s*"([^"]+)"', content, re.MULTILINE | re.DOTALL | re.IGNORECASE)
+
+    # Also capture project name
+    name_match = re.search(r'name\s*=\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
     if name_match:
         primary_lines.append(f'name = "{name_match.group(1)}"')
-    
+
     return '\n'.join(primary_lines)
 
 
 def detect_from_pyproject_toml(content: str) -> Set[str]:
-    """Detect technologies from pyproject.toml primary dependencies only."""
+    """Detect technologies from pyproject.toml primary dependencies."""
     technologies = set()
     technologies.add("Python")
-    
-    # Use only primary deps to avoid false positives from test/optional groups
+
     primary_section = _get_primary_deps_from_pyproject(content)
-    check_text = primary_section.lower() if primary_section else ""
-    
-    # Also always check the project name for direct framework repos
+    check_text = primary_section.lower() if primary_section else content.lower()
+
     name_match = re.search(r'name\s*=\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
     project_name = name_match.group(1).lower().strip() if name_match else ""
-    
+
     if project_name == "fastapi" or re.search(r'\bfastapi\b', check_text):
         technologies.add("FastAPI")
     if project_name == "flask" or re.search(r'\bflask\b', check_text):
         technologies.add("Flask")
     if project_name in ("django", "django-cms") or re.search(r'\bdjango\b', check_text):
         technologies.add("Django")
-    
+
     return technologies
 
 
@@ -329,37 +232,31 @@ def detect_from_package_lock_json(content: str) -> Set[str]:
         dependencies = data.get("dependencies") or {}
         packages = data.get("packages") or {}
         package_name = str(data.get("name", "")).lower()
-        
-        # In lockfile v3, dependencies might be in "packages" -> "" -> "dependencies"
+
         root_pkg = packages.get("") or {}
         root_deps = root_pkg.get("dependencies") or {}
         root_dev_deps = root_pkg.get("devDependencies") or {}
-        
         all_deps = {**dependencies, **root_deps, **root_dev_deps, **packages}
-        
-        # Frontend frameworks
+
         if "react" in all_deps or "node_modules/react" in all_deps or package_name == "react":
             technologies.add("React")
         if "next" in all_deps or "node_modules/next" in all_deps or package_name == "next":
             technologies.add("Next.js")
+            technologies.add("React")
         if "vue" in all_deps or "node_modules/vue" in all_deps or package_name == "vue":
             technologies.add("Vue")
         if "@angular/core" in all_deps or "node_modules/@angular/core" in all_deps or package_name == "angular":
             technologies.add("Angular")
         if "vite" in all_deps or "node_modules/vite" in all_deps or package_name == "vite":
             technologies.add("Vite")
-        
-        # Backend
         if "express" in all_deps or "node_modules/express" in all_deps or package_name == "express":
             technologies.add("Express")
-        
-        # Node.js is implied
+
         technologies.add("Node.js")
         technologies.add("JavaScript")
-        
     except (json.JSONDecodeError, AttributeError, TypeError):
         pass
-    
+
     return technologies
 
 
@@ -382,13 +279,11 @@ def detect_flask_or_fastapi(content: str) -> Set[str]:
     """Detect Flask or FastAPI from app.py."""
     technologies = set()
     technologies.add("Python")
-    
     content_lower = content.lower()
     if re.search(r'from\s+fastapi\s+import|import\s+fastapi', content_lower):
         technologies.add("FastAPI")
     elif re.search(r'from\s+flask\s+import|import\s+flask', content_lower):
         technologies.add("Flask")
-    
     return technologies
 
 
@@ -396,7 +291,6 @@ def detect_python_framework(content: str) -> Set[str]:
     """Detect Python frameworks from main.py."""
     technologies = set()
     technologies.add("Python")
-    
     content_lower = content.lower()
     if re.search(r'from\s+fastapi\s+import|import\s+fastapi', content_lower):
         technologies.add("FastAPI")
@@ -404,62 +298,170 @@ def detect_python_framework(content: str) -> Set[str]:
         technologies.add("Flask")
     elif re.search(r'from\s+django\s+import|import\s+django', content_lower):
         technologies.add("Django")
-    
     return technologies
 
 
-async def detect_technologies(owner: str, repo_name: str, default_branch: str = "main") -> Set[str]:
+def _is_relevant_path(path: str) -> bool:
+    """Filter out noise directories like node_modules, .git, venv, etc."""
+    parts = set(path.split("/"))
+    return not bool(parts & IGNORED_PATH_SEGMENTS)
+
+
+async def detect_technologies(
+    owner: str,
+    repo_name: str,
+    default_branch: str = "main",
+    tree_entries: Optional[List[Dict[str, Any]]] = None,
+    client: Optional[httpx.AsyncClient] = None,
+) -> Set[str]:
     """
-    Detect technologies in a repository by fetching and analyzing key files.
-    
-    Args:
-        owner: Repository owner
-        repo_name: Repository name
-        default_branch: Repository default branch name
-    
-    Returns:
-        Set of detected technologies
+    Detect technologies in a repository using a tree-first approach.
+    Inspects normalized paths from the recursive Git Tree, then fetches at most
+    1-2 manifest files (package.json, requirements.txt, pyproject.toml) to identify
+    frameworks, without blind individual file probing.
     """
     technologies: Set[str] = set()
-    headers = get_github_headers()
-    logger.info("Starting technology detection for %s/%s", owner, repo_name)
 
-    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True, headers=headers) as client:
-        for file_path, detector_name in DETECTION_FILES.items():
-            detector_func = globals().get(detector_name)
-            if not callable(detector_func):
-                logger.warning("No detector function found for %s", detector_name)
-                continue
+    # Determine if we need an internal client
+    client_provided = client is not None
+    active_client = client if client_provided else httpx.AsyncClient(
+        timeout=TIMEOUT,
+        follow_redirects=True,
+        headers=get_github_headers()
+    )
 
-            try:
-                logger.debug("Checking file %s", file_path)
-                content = await fetch_file_content(owner, repo_name, file_path, client, default_branch=default_branch)
+    try:
+        # If tree_entries was not passed, fetch it now
+        if tree_entries is None:
+            from app.services.github_client import fetch_git_tree
+            tree_entries = await fetch_git_tree(owner, repo_name, default_branch, active_client)
 
-                if file_path == "package.json":
-                    workspace_patterns = parse_workspaces_from_package_json(content)
-                    if workspace_patterns:
-                        package_paths = await expand_workspace_package_paths(owner, repo_name, workspace_patterns, client)
-                        for package_path in package_paths:
-                            package_content = await fetch_file_content(owner, repo_name, package_path, client, default_branch=default_branch)
-                            if package_content:
-                                detected = detector_func(package_content)
-                                logger.info("Detected %s from workspace package %s", detected, package_path)
-                                technologies.update(detected)
+        if tree_entries:
+            # 1. Normalize and filter file paths
+            relevant_files = [
+                entry["path"].replace("\\", "/")
+                for entry in tree_entries
+                if entry.get("type") in ("blob", "file") and _is_relevant_path(entry.get("path", ""))
+            ]
 
-                if not content:
-                    logger.debug("No content found for %s", file_path)
+            filenames_set = {p.split("/")[-1].lower() for p in relevant_files}
+            paths_lower = [p.lower() for p in relevant_files]
+
+            # 2. Structural & Filename-based Detection (0 API calls!)
+            # Ecosystems & Languages
+            if any(f in filenames_set for f in ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb")):
+                technologies.add("Node.js")
+                technologies.add("JavaScript")
+            if any(p.endswith((".ts", ".tsx")) for p in paths_lower) or "tsconfig.json" in filenames_set:
+                technologies.add("TypeScript")
+                technologies.add("JavaScript")
+                technologies.add("Node.js")
+            if any(p.endswith(".py") for p in paths_lower) or any(f in filenames_set for f in ("requirements.txt", "pyproject.toml", "pipfile", "setup.py", "manage.py")):
+                technologies.add("Python")
+            if any(p.endswith(".go") for p in paths_lower) or "go.mod" in filenames_set:
+                technologies.add("Go")
+            if any(p.endswith(".rs") for p in paths_lower) or "cargo.toml" in filenames_set:
+                technologies.add("Rust")
+            if any(p.endswith(".java") for p in paths_lower) or any(f in filenames_set for f in ("pom.xml", "build.gradle")):
+                technologies.add("Java")
+            if "pom.xml" in filenames_set:
+                technologies.add("Maven")
+            if any(f in filenames_set for f in ("build.gradle", "build.gradle.kts")):
+                technologies.add("Gradle")
+            if any(p.endswith(".kt") for p in paths_lower) or "build.gradle.kts" in filenames_set:
+                technologies.add("Kotlin")
+            if any(p.endswith(".php") for p in paths_lower) or "composer.json" in filenames_set:
+                technologies.add("PHP")
+            if any(p.endswith(".rb") for p in paths_lower) or "gemfile" in filenames_set:
+                technologies.add("Ruby")
+            if any(p.endswith((".csproj", ".sln", ".cs")) for p in paths_lower):
+                technologies.add("C#")
+                technologies.add(".NET")
+            if any(f in filenames_set for f in ("dockerfile", "docker-compose.yml", "docker-compose.yaml")) or any(f.endswith(".dockerfile") for f in filenames_set):
+                technologies.add("Docker")
+
+            # Package managers
+            if "package-lock.json" in filenames_set:
+                technologies.add("npm")
+            if "yarn.lock" in filenames_set:
+                technologies.add("Yarn")
+            if "pnpm-lock.yaml" in filenames_set:
+                technologies.add("pnpm")
+            if "bun.lockb" in filenames_set:
+                technologies.add("Bun")
+
+            # Framework configs
+            if any(f in filenames_set for f in ("vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.cjs")):
+                technologies.add("Vite")
+            if any(f in filenames_set for f in ("next.config.js", "next.config.mjs", "next.config.ts")) or any("/pages/_app" in p or "/app/layout" in p for p in paths_lower):
+                technologies.add("Next.js")
+                technologies.add("React")
+                technologies.add("Node.js")
+                technologies.add("JavaScript")
+            if any(f in filenames_set for f in ("nuxt.config.js", "nuxt.config.ts")):
+                technologies.add("Nuxt")
+                technologies.add("Vue")
+            if any(f in filenames_set for f in ("vue.config.js", "vue.config.ts")) or any(p.endswith(".vue") for p in paths_lower):
+                technologies.add("Vue")
+            if any(f in filenames_set for f in ("svelte.config.js", "svelte.config.ts")) or any(p.endswith(".svelte") for p in paths_lower):
+                technologies.add("Svelte")
+            if "angular.json" in filenames_set:
+                technologies.add("Angular")
+            if any(f in filenames_set for f in ("tailwind.config.js", "tailwind.config.ts", "tailwind.config.mjs", "tailwind.config.cjs")):
+                technologies.add("Tailwind CSS")
+            if "manage.py" in filenames_set:
+                technologies.add("Django")
+                technologies.add("Python")
+
+            # 3. Targeted Content Inspection (Fetch ONLY existing manifest files, max 2-3 files)
+            # Find candidate package.json files (prefer root, then frontend/client/packages)
+            package_json_candidates = [p for p in relevant_files if p.lower().endswith("package.json")]
+            package_json_candidates.sort(key=lambda p: (p.count("/"), len(p)))
+
+            for pkg_path in package_json_candidates[:2]:
+                content = await fetch_file_content(owner, repo_name, pkg_path, active_client, default_branch=default_branch)
+                if content:
+                    detected = detect_from_package_json(content)
+                    technologies.update(detected)
+
+            # Find candidate Python requirement files
+            py_manifest_candidates = [
+                p for p in relevant_files
+                if p.lower().endswith("requirements.txt") or p.lower().endswith("pyproject.toml")
+            ]
+            py_manifest_candidates.sort(key=lambda p: (0 if "requirements" in p.lower() else 1, p.count("/")))
+
+            for py_path in py_manifest_candidates[:2]:
+                content = await fetch_file_content(owner, repo_name, py_path, active_client, default_branch=default_branch)
+                if content:
+                    if py_path.lower().endswith("pyproject.toml"):
+                        technologies.update(detect_from_pyproject_toml(content))
+                    else:
+                        technologies.update(detect_from_requirements_txt(content))
+
+            # If Python frameworks not detected yet, check standalone app.py or main.py
+            if not ({"FastAPI", "Flask", "Django"} & technologies) and "Python" in technologies:
+                py_scripts = [p for p in relevant_files if p.lower().endswith(("/app.py", "app.py", "/main.py", "main.py"))]
+                py_scripts.sort(key=lambda p: p.count("/"))
+                for script_path in py_scripts[:1]:
+                    content = await fetch_file_content(owner, repo_name, script_path, active_client, default_branch=default_branch)
+                    if content:
+                        technologies.update(detect_python_framework(content))
+
+        else:
+            # Fallback when Git tree is unavailable (e.g. empty repository or tree API error)
+            logger.debug("Tree entries unavailable, executing fallback detection for %s/%s", owner, repo_name)
+            for file_path, detector_name in DETECTION_FILES.items():
+                detector_func = globals().get(detector_name)
+                if not callable(detector_func):
                     continue
+                content = await fetch_file_content(owner, repo_name, file_path, active_client, default_branch=default_branch)
+                if content:
+                    technologies.update(detector_func(content))
 
-                detected = detector_func(content)
-                logger.info("Detected %s from %s", detected, file_path)
-                technologies.update(detected)
-            except Exception as exc:
-                logger.exception("Detection failed for %s: %s", file_path, exc)
-                continue
-
-    if not technologies:
-        logger.warning("No technologies detected for %s/%s", owner, repo_name)
-    else:
-        logger.info("Final technologies for %s/%s: %s", owner, repo_name, technologies)
+    finally:
+        if not client_provided:
+            await active_client.aclose()
 
     return technologies
+

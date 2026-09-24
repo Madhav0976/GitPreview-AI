@@ -1,5 +1,9 @@
 import asyncio
+import logging
+from typing import Dict, Any, List
+
 from fastapi import APIRouter, HTTPException
+import httpx
 
 from app.models import (
     AnalyzeRequest,
@@ -9,124 +13,187 @@ from app.models import (
 )
 
 from app.services.github_client import (
-    fetch_repo_metadata,
     parse_repo_url,
+    get_github_headers,
+    fetch_repo_info,
+    fetch_languages,
+    fetch_git_tree,
+    TIMEOUT,
 )
 
+from app.services.technology_detector import detect_technologies
 from app.services.folder_analyzer import detect_folder_structure
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
 @router.post("/analyze", response_model=AnalysisResponse, tags=["analysis"])
 async def analyze(request: AnalyzeRequest):
+    repo_url = str(request.repoUrl).strip()
+
+    # Validate GitHub URL
+    if "github.com" not in repo_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid GitHub repository URL"
+        )
+
     try:
-        repo_url = str(request.repoUrl)
-
-        # Validate GitHub URL
-        if "github.com" not in repo_url:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid GitHub repository URL"
-            )
-
         owner, repo_name = parse_repo_url(repo_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-        # Run both tasks in parallel
-        metadata_task = fetch_repo_metadata(repo_url)
-        folder_task = detect_folder_structure(owner, repo_name)
+    headers = get_github_headers()
 
-        metadata_dict, folder_analysis_data = await asyncio.gather(
-            metadata_task,
-            folder_task
-        )
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True, headers=headers) as client:
+            # 1. Fetch core repository information
+            repo_data = await fetch_repo_info(owner, repo_name, client)
+            default_branch = repo_data.get("default_branch", "main")
 
-        # Detect Project Type
-        techs = [t.lower() for t in metadata_dict.get("technologies", [])]
-        repo_name_lower = repo_name.lower()
-        project_type = "Library"
-        
-        if "next.js" in techs or "django" in techs or "nuxt" in techs:
-            project_type = "Full Stack App"
-        elif "fastapi" in techs or "flask" in techs or "express" in techs:
-            project_type = "Backend API"
-        elif "react" in techs or "vue" in techs or "angular" in techs:
-            if repo_name_lower in ["react", "vue", "angular", "next.js"]:
-                project_type = "Framework"
+            # 2. Fetch languages breakdown and recursive git tree in parallel
+            lang_task = fetch_languages(owner, repo_name, client)
+            tree_task = fetch_git_tree(owner, repo_name, default_branch, client)
+            languages_data, tree_entries = await asyncio.gather(lang_task, tree_task)
+
+            # 3. Detect technologies and folder structure in parallel using the tree
+            tech_task = detect_technologies(
+                owner, repo_name, default_branch=default_branch, tree_entries=tree_entries, client=client
+            )
+            folder_task = detect_folder_structure(owner, repo_name, tree_entries=tree_entries)
+            technologies_set, folder_analysis_data = await asyncio.gather(tech_task, folder_task)
+
+            technologies_list = sorted(list(technologies_set))
+
+            metadata_dict: Dict[str, Any] = {
+                "owner": owner,
+                "name": repo_data.get("name", repo_name),
+                "description": repo_data.get("description"),
+                "stars": repo_data.get("stargazers_count", 0),
+                "forks": repo_data.get("forks_count", 0),
+                "license": repo_data.get("license", {}).get("name") if repo_data.get("license") else None,
+                "defaultBranch": default_branch,
+                "languages": languages_data,
+                "technologies": technologies_list,
+            }
+
+            # 4. Project Type Detection (Enhanced with nested directory & multi-stack support)
+            techs_lower = [t.lower() for t in technologies_list]
+            folders_lower = [f.lower() for f in folder_analysis_data.get("folderSummary", [])]
+            repo_name_lower = repo_name.lower()
+
+            has_frontend_dir = any(d in folders_lower for d in ("frontend", "client", "web", "ui"))
+            has_backend_dir = any(d in folders_lower for d in ("backend", "server", "api"))
+
+            frontend_techs = {"react", "vue", "angular", "svelte", "next.js", "vite", "nuxt"}
+            backend_techs = {"fastapi", "flask", "express", "django", "nestjs", "node.js", "go", "rust"}
+
+            has_fe_tech = bool(set(techs_lower) & frontend_techs)
+            has_be_tech = bool(set(techs_lower) & (backend_techs - {"node.js"}))
+
+            project_type = "Library"
+
+            if "next.js" in techs_lower or "django" in techs_lower or "nuxt" in techs_lower:
+                project_type = "Full Stack App"
+            elif (has_frontend_dir and has_backend_dir) or (has_fe_tech and has_be_tech):
+                project_type = "Full Stack App"
+            elif "fastapi" in techs_lower or "flask" in techs_lower or "express" in techs_lower or "nestjs" in techs_lower:
+                project_type = "Backend API"
+            elif any(t in techs_lower for t in ("react", "vue", "angular", "svelte", "vite")):
+                if repo_name_lower in ("react", "vue", "angular", "svelte", "vite", "next.js"):
+                    project_type = "Framework"
+                else:
+                    project_type = "Frontend App"
+            elif "go" in techs_lower or "rust" in techs_lower:
+                project_type = "Backend API" if has_backend_dir else "CLI / Systems App"
+
+            metadata_dict["projectType"] = project_type
+
+            # 5. Generate Summary
+            desc = (metadata_dict.get("description") or "").strip()
+            summary_parts: List[str] = []
+            name = metadata_dict.get("name", repo_name)
+
+            # Sentence 1: Purpose & Identity
+            primary_lang = ""
+            if languages_data:
+                primary_lang = max(languages_data.items(), key=lambda x: x[1])[0]
+
+            if desc:
+                if not desc.endswith('.'):
+                    desc += '.'
+                summary_parts.append(
+                    f"{name} is a {primary_lang + ' ' if primary_lang else ''}{project_type.lower()}. {desc}"
+                )
             else:
-                project_type = "Frontend App"
+                summary_parts.append(
+                    f"{name} is a {primary_lang + ' ' if primary_lang else ''}{project_type.lower()} repository."
+                )
 
-        metadata_dict["projectType"] = project_type
+            # Sentence 2: Architecture & Tooling
+            arch_parts = []
+            if "packages" in folders_lower or "workspaces" in folders_lower:
+                arch_parts.append("uses a monorepo architecture")
+            elif has_frontend_dir and has_backend_dir:
+                arch_parts.append("features a decoupled frontend and backend architecture")
 
-        # Generate Summary
-        desc = (metadata_dict.get("description") or "").strip()
-        tech_list = metadata_dict.get("technologies", [])
-        folders = folder_analysis_data.get("folderSummary", [])
-        
-        summary_parts = []
-        name = metadata_dict.get('name', repo_name)
-        
-        # Sentence 1: Purpose & Identity
-        primary_lang = ""
-        langs = metadata_dict.get("languages", {})
-        if langs:
-            primary_lang = max(langs.items(), key=lambda x: x[1])[0]
-            
-        if desc:
-            if not desc.endswith('.'): desc += '.'
-            summary_parts.append(f"{name} is a {primary_lang + ' ' if primary_lang else ''}{project_type.lower()}. {desc}")
-        else:
-            summary_parts.append(f"{name} is a {primary_lang + ' ' if primary_lang else ''}{project_type.lower()} repository.")
-            
-        # Sentence 2: Architecture & Tooling
-        arch_parts = []
-        if "packages" in folders or "workspaces" in folders:
-            arch_parts.append("uses a monorepo architecture")
-        
-        if tech_list:
-            top_techs = tech_list[:3]
-            tech_str = ", ".join(top_techs) if len(top_techs) < 3 else f"{top_techs[0]}, {top_techs[1]}, and {top_techs[2]}"
-            arch_parts.append(f"is built with {tech_str}")
-            
-        if arch_parts:
-            summary_parts.append(f"This project {' and '.join(arch_parts)}.")
-            
-        # Sentence 3: Target Audience / Closing
-        if "Framework" in project_type or "Library" in project_type:
-            summary_parts.append(f"It contains the core source code, tooling, and documentation for developers building with {name}.")
-        elif "React" in tech_list or "Next.js" in tech_list or project_type == "Frontend App":
-            summary_parts.append("It is intended for frontend developers interested in modern web infrastructure.")
-        elif "Python" in tech_list or project_type == "Backend API":
-            summary_parts.append("It is intended for backend developers interested in scalable API development.")
-        else:
-            summary_parts.append("It serves as a reference for developers exploring this technology stack.")
-            
-        metadata_dict["summary"] = " ".join(summary_parts)
+            if technologies_list:
+                top_techs = technologies_list[:3]
+                tech_str = ", ".join(top_techs) if len(top_techs) < 3 else f"{top_techs[0]}, {top_techs[1]}, and {top_techs[2]}"
+                arch_parts.append(f"is built with {tech_str}")
 
-        metadata = RepositoryMetadata(**metadata_dict)
-        folder_analysis = FolderAnalysis(**folder_analysis_data)
+            if arch_parts:
+                summary_parts.append(f"This project {' and '.join(arch_parts)}.")
 
-        return AnalysisResponse(
-            metadata=metadata,
-            folderAnalysis=folder_analysis
-        )
+            # Sentence 3: Target Audience / Closing
+            if "Framework" in project_type or "Library" in project_type:
+                summary_parts.append(f"It contains the core source code, tooling, and documentation for developers building with {name}.")
+            elif "Full Stack" in project_type:
+                summary_parts.append("It provides an end-to-end full-stack application experience with client and server components.")
+            elif project_type == "Frontend App" or has_fe_tech:
+                summary_parts.append("It is intended for frontend developers interested in modern web infrastructure.")
+            elif project_type == "Backend API" or has_be_tech:
+                summary_parts.append("It is intended for backend developers interested in scalable API development.")
+            else:
+                summary_parts.append("It serves as a reference for developers exploring this technology stack.")
+
+            metadata_dict["summary"] = " ".join(summary_parts)
+
+            metadata = RepositoryMetadata(**metadata_dict)
+            folder_analysis = FolderAnalysis(**folder_analysis_data)
+
+            return AnalysisResponse(
+                metadata=metadata,
+                folderAnalysis=folder_analysis
+            )
 
     except HTTPException:
         raise
-
-    except Exception as e:
-        import httpx
-        error_msg = str(e)
-        if isinstance(e, httpx.HTTPStatusError):
-            if e.response.status_code == 404:
-                raise HTTPException(status_code=404, detail="Repository not found or is private.")
-            elif e.response.status_code in [403, 429]:
-                raise HTTPException(status_code=429, detail="GitHub API rate limit exceeded. Please try again later.")
-            error_msg = f"GitHub API error: {e.response.status_code}"
-        elif isinstance(e, httpx.TimeoutException):
-            raise HTTPException(status_code=504, detail="GitHub API request timed out.")
-
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        if status == 404:
+            raise HTTPException(status_code=404, detail="Repository not found or is private.")
+        elif status == 401:
+            raise HTTPException(
+                status_code=401,
+                detail="GitHub API authentication failed. The configured token is invalid or expired."
+            )
+        elif status in (403, 429):
+            raise HTTPException(
+                status_code=429,
+                detail="GitHub API rate limit exceeded. Please try again later."
+            )
         raise HTTPException(
             status_code=500,
-            detail=f"Error analyzing repository: {error_msg}"
+            detail=f"GitHub API error: {status}"
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="GitHub API request timed out.")
+    except Exception as e:
+        logger.exception("Unexpected error analyzing repository %s", repo_url)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error analyzing repository: {str(e)}"
         )

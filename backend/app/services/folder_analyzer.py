@@ -1,11 +1,12 @@
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 
+from app.services.github_client import get_github_headers
+
 GITHUB_API_BASE = "https://api.github.com/repos"
-TIMEOUT = 10
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", None)
+TIMEOUT = 12
 
 ENTRY_POINT_CANDIDATES = [
     "main.py",
@@ -33,6 +34,19 @@ ENTRY_POINT_CANDIDATES = [
     "src/main.tsx",
 
     "app/page.tsx",
+    "app/page.jsx",
+
+    # Nested frontend/backend entry points
+    "frontend/src/main.tsx",
+    "frontend/src/index.tsx",
+    "frontend/app/page.tsx",
+    "client/src/main.tsx",
+    "client/src/index.js",
+    "backend/main.py",
+    "backend/app.py",
+    "server/index.js",
+    "server/index.ts",
+    "server/main.py",
 ]
 
 IMPORTANT_FILE_NAMES = [
@@ -46,16 +60,12 @@ IMPORTANT_FILE_NAMES = [
     ".gitignore",
     "next.config.js",
     "vite.config.ts",
+    "cargo.toml",
+    "go.mod",
+    "pom.xml",
 ]
 
 FOLDER_MARKERS = ["test", "tests", "docs"]
-
-
-def get_github_headers() -> Dict[str, str]:
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    return headers
 
 
 async def list_directory(owner: str, repo_name: str, path: str = "") -> List[Dict[str, Any]]:
@@ -91,14 +101,14 @@ def detect_entry_points(root_names: List[str], src_names: List[str]) -> List[str
     src_set = {normalize_name(name): name for name in src_names}
 
     for candidate in ENTRY_POINT_CANDIDATES:
-        if "src/" in candidate:
+        if "src/" in candidate and "/" not in candidate.replace("src/", ""):
             src_file = candidate.split("src/")[1]
             if normalize_name(src_file) in src_set:
                 results.append(candidate)
         else:
             if normalize_name(candidate) in root_set:
                 results.append(candidate)
-                
+
     # Safe fallback strategy
     if not results:
         fallbacks = [
@@ -109,18 +119,16 @@ def detect_entry_points(root_names: List[str], src_names: List[str]) -> List[str
             if normalize_name(fallback) in root_set:
                 results.append(root_set[normalize_name(fallback)])
                 break
-                
-        # If still empty, try to find a README
+
         if not results:
             for root_name in root_names:
                 if normalize_name(root_name).startswith("readme"):
                     results.append(root_name)
                     break
-                    
-        # Ultimate fallback: just return the first file if one exists
+
         if not results and root_names:
             results.append(root_names[0])
-            
+
     return results
 
 
@@ -134,9 +142,7 @@ def detect_important_files(root_names: List[str], workflows: List[str]) -> List[
                 important.append(root_name)
             elif important_name == "readme" and is_readme(root_name):
                 important.append(root_name)
-    
 
-    # Add docker-compose if it exists in root regardless of case
     if normalize_name("docker-compose.yml") in root_lower and "docker-compose.yml" not in important:
         important.append(root_lower[normalize_name("docker-compose.yml")])
 
@@ -147,7 +153,64 @@ def detect_folder_summary(root_dirs: List[str]) -> List[str]:
     return sorted(root_dirs)
 
 
-async def detect_folder_structure(owner: str, repo_name: str) -> Dict[str, List[str]]:
+async def detect_folder_structure(
+    owner: str,
+    repo_name: str,
+    tree_entries: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, List[str]]:
+    """
+    Detect folder structure, entry points, and important files.
+    If tree_entries is provided, performs all calculations in-memory with 0 API calls.
+    Otherwise, gracefully falls back to GitHub contents API.
+    """
+    if tree_entries is not None:
+        file_paths = [
+            e["path"].replace("\\", "/")
+            for e in tree_entries
+            if e.get("type") in ("blob", "file") and "path" in e
+        ]
+        file_paths_lower_map = {p.lower(): p for p in file_paths}
+
+        # Root files and root directories
+        root_files = [p for p in file_paths if "/" not in p]
+        root_dirs_set = set()
+        for p in file_paths:
+            if "/" in p:
+                top_dir = p.split("/")[0]
+                if top_dir not in (".git", "node_modules", "venv", ".venv"):
+                    root_dirs_set.add(top_dir)
+
+        workflows = [p for p in file_paths if p.startswith(".github/workflows/")]
+        src_files = [p[4:] for p in file_paths if p.startswith("src/")]
+
+        # Detect entry points from candidates in tree
+        entry_points = []
+        for candidate in ENTRY_POINT_CANDIDATES:
+            cand_lower = candidate.lower()
+            if cand_lower in file_paths_lower_map:
+                entry_points.append(file_paths_lower_map[cand_lower])
+
+        # If still empty, use fallback strategy
+        if not entry_points:
+            entry_points = detect_entry_points(root_files, src_files)
+
+        # Detect important files from root files and workflows
+        important_files = detect_important_files(root_files, workflows)
+
+        # If root lacks manifest but nested exists, surface them
+        for nested_manifest in ("frontend/package.json", "backend/requirements.txt", "client/package.json", "server/package.json"):
+            if nested_manifest.lower() in file_paths_lower_map and nested_manifest not in important_files:
+                important_files.append(file_paths_lower_map[nested_manifest.lower()])
+
+        folder_summary = sorted(list(root_dirs_set))
+
+        return {
+            "entryPoints": sorted(dict.fromkeys(entry_points))[:6],
+            "importantFiles": sorted(dict.fromkeys(important_files)),
+            "folderSummary": folder_summary,
+        }
+
+    # Fallback when tree_entries is not provided
     root_entries = await list_directory(owner, repo_name)
     root_files = [entry["name"] for entry in root_entries if entry.get("type") == "file"]
     root_dirs = [entry["name"] for entry in root_entries if entry.get("type") == "dir"]
@@ -164,11 +227,8 @@ async def detect_folder_structure(owner: str, repo_name: str) -> Dict[str, List[
         src_entries = await list_directory(owner, repo_name, "src")
         src_files = [entry["name"] for entry in src_entries if entry.get("type") == "file"]
 
-    # Entry points are only recorded if they exist.
     entry_points = detect_entry_points(root_files, src_files)
-
     important_files = detect_important_files(root_files, workflows)
-
     folder_summary = detect_folder_summary(root_dirs)
 
     return {
@@ -176,3 +236,4 @@ async def detect_folder_structure(owner: str, repo_name: str) -> Dict[str, List[
         "importantFiles": important_files,
         "folderSummary": folder_summary,
     }
+

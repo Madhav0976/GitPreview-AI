@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi uvicorn httpx pydantic
+RUN pip install --no-cache-dir fastapi uvicorn httpx pydantic python-dotenv
 
 COPY backend /app
 

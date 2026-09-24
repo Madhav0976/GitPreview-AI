@@ -30,4 +30,4 @@ class FolderAnalysis(BaseModel):
 class AnalysisResponse(BaseModel):
     """Simplified response with repository metadata and folder analysis"""
     metadata: RepositoryMetadata
-    folderAnalysis: FolderAnalysis
+    folderAnalysis: FolderAnalysis = FolderAnalysis()
