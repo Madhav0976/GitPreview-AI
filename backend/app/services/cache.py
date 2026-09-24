@@ -1,5 +1,5 @@
 """
-In-memory async-safe TTL cache for repository analysis results.
+In-memory async-safe TTL cache for repository analysis results and preview assets.
 Supports request coalescing (single-flight) to prevent redundant upstream API calls.
 """
 
@@ -8,8 +8,6 @@ import logging
 import time
 from typing import Dict, Optional, Tuple, Callable, Awaitable, Any
 
-from app.models import AnalysisResponse
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 30 * 60  # 30 minutes
@@ -17,14 +15,14 @@ DEFAULT_TTL_SECONDS = 30 * 60  # 30 minutes
 
 class AnalysisCache:
     """
-    In-memory async-safe TTL cache for repository analysis responses.
-    Includes in-flight request coalescing to prevent duplicate concurrent upstream calls.
+    In-memory async-safe TTL cache with in-flight request coalescing.
+    Used for analysis results and static preview assets.
     """
 
     def __init__(self, ttl_seconds: float = DEFAULT_TTL_SECONDS):
         self.ttl_seconds = ttl_seconds
-        # key -> (AnalysisResponse, expires_at_timestamp)
-        self._cache: Dict[str, Tuple[AnalysisResponse, float]] = {}
+        # key -> (payload, expires_at_timestamp)
+        self._cache: Dict[str, Tuple[Any, float]] = {}
         # key -> asyncio.Future for in-flight leader-follower coalescing
         self._in_flight: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
@@ -34,89 +32,92 @@ class AnalysisCache:
         """Normalize owner and repository to lowercase key."""
         return f"{owner.strip().lower()}/{repo.strip().lower()}"
 
-    async def get(self, owner: str, repo: str) -> Optional[AnalysisResponse]:
-        """Get cached response if present and not expired."""
-        key = self.normalize_key(owner, repo)
+    async def get_by_key(self, key: str) -> Optional[Any]:
+        """Get cached value by exact string key if not expired."""
+        normalized_key = key.strip().lower()
         async with self._lock:
-            entry = self._cache.get(key)
+            entry = self._cache.get(normalized_key)
             if entry:
-                response, expires_at = entry
+                value, expires_at = entry
                 if time.monotonic() < expires_at:
-                    return response
-                # Entry expired: remove from cache
-                del self._cache[key]
+                    return value
+                del self._cache[normalized_key]
         return None
 
-    async def set(
-        self,
-        owner: str,
-        repo: str,
-        response: AnalysisResponse,
-        ttl: Optional[float] = None
-    ) -> None:
-        """Store a successful analysis response with TTL."""
-        key = self.normalize_key(owner, repo)
+    async def set_by_key(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
+        """Store value with TTL by exact string key."""
+        normalized_key = key.strip().lower()
         ttl_val = ttl if ttl is not None else self.ttl_seconds
         expires_at = time.monotonic() + ttl_val
         async with self._lock:
-            self._cache[key] = (response, expires_at)
+            self._cache[normalized_key] = (value, expires_at)
 
-    async def get_or_compute(
+    async def get_or_compute_by_key(
         self,
-        owner: str,
-        repo: str,
-        compute_fn: Callable[[], Awaitable[AnalysisResponse]],
+        key: str,
+        compute_fn: Callable[[], Awaitable[Any]],
         ttl: Optional[float] = None,
-    ) -> AnalysisResponse:
+    ) -> Any:
         """
         Retrieve cached result or compute it asynchronously with in-flight coalescing.
         If multiple coroutines request the same key concurrently, only one runs compute_fn,
         and all others await the result. Errors are never cached.
         """
-        key = self.normalize_key(owner, repo)
+        normalized_key = key.strip().lower()
 
         async with self._lock:
-            # 1. Check if already cached and valid
-            entry = self._cache.get(key)
+            entry = self._cache.get(normalized_key)
             if entry:
                 cached_res, expires_at = entry
                 if time.monotonic() < expires_at:
                     return cached_res
-                del self._cache[key]
+                del self._cache[normalized_key]
 
-            # 2. Check if another coroutine is already in-flight for this key
-            if key in self._in_flight:
-                future = self._in_flight[key]
+            if normalized_key in self._in_flight:
+                future = self._in_flight[normalized_key]
                 is_leader = False
             else:
                 loop = asyncio.get_running_loop()
                 future = loop.create_future()
-                self._in_flight[key] = future
+                self._in_flight[normalized_key] = future
                 is_leader = True
 
         if not is_leader:
-            # Follower: await the leader's computation
-            logger.debug("Coalescing concurrent request for %s to in-flight leader", key)
+            logger.debug("Coalescing concurrent request for %s to in-flight leader", normalized_key)
             return await future
 
-        # Leader: compute the result
         try:
             result = await compute_fn()
-            # Only cache successful results
-            await self.set(owner, repo, result, ttl=ttl)
+            await self.set_by_key(normalized_key, result, ttl=ttl)
             if not future.done():
                 future.set_result(result)
             return result
         except Exception as exc:
-            # Do NOT cache errors. Propagate error to followers.
             if not future.done():
                 future.set_exception(exc)
-                # Mark as retrieved so asyncio doesn't log unretrieved warning if no followers
                 future.exception()
             raise
         finally:
             async with self._lock:
-                self._in_flight.pop(key, None)
+                self._in_flight.pop(normalized_key, None)
+
+    async def get(self, owner: str, repo: str) -> Optional[Any]:
+        """Convenience method for (owner, repo) pairs."""
+        return await self.get_by_key(self.normalize_key(owner, repo))
+
+    async def set(self, owner: str, repo: str, response: Any, ttl: Optional[float] = None) -> None:
+        """Convenience method for (owner, repo) pairs."""
+        await self.set_by_key(self.normalize_key(owner, repo), response, ttl=ttl)
+
+    async def get_or_compute(
+        self,
+        owner: str,
+        repo: str,
+        compute_fn: Callable[[], Awaitable[Any]],
+        ttl: Optional[float] = None,
+    ) -> Any:
+        """Convenience method for (owner, repo) pairs."""
+        return await self.get_or_compute_by_key(self.normalize_key(owner, repo), compute_fn, ttl=ttl)
 
     async def clear(self) -> None:
         """Clear all cached entries and in-flight tasks."""

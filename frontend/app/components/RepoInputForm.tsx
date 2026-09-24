@@ -196,7 +196,7 @@ export default function RepoInputForm() {
               🔄 Start Over
             </button>
           </div>
-          <Dashboard data={result} />
+          <Dashboard data={result} repoUrl={repoUrl.trim()} />
         </div>
       ) : null}
     </div>

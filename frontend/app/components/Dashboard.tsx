@@ -1,4 +1,10 @@
+"use client"
+
+import { useState, useEffect } from 'react'
 import type { AnalysisResponse } from '@/lib/types'
+import { detectPreview, type PreviewDetectResponse } from '@/lib/preview'
+import PreviewBadge from './PreviewBadge'
+import StaticPreviewModal from './StaticPreviewModal'
 
 function getTechColor(tech: string) {
   const t = tech.toLowerCase();
@@ -17,24 +23,55 @@ function formatNumber(num: number) {
   return num.toString();
 }
 
-export default function Dashboard({ data }: { data: AnalysisResponse }) {
+interface DashboardProps {
+  data: AnalysisResponse
+  repoUrl?: string
+}
+
+export default function Dashboard({ data, repoUrl }: DashboardProps) {
   const { metadata, folderAnalysis } = data;
-  
+
+  const [previewData, setPreviewData] = useState<PreviewDetectResponse | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+
+  useEffect(() => {
+    const targetUrl = repoUrl || `https://github.com/${metadata.owner}/${metadata.name}`;
+    setPreviewLoading(true);
+
+    detectPreview(targetUrl)
+      .then((res) => setPreviewData(res))
+      .catch((err) => {
+        setPreviewData({
+          status: 'UNSUPPORTED',
+          category: metadata.projectType || 'unknown',
+          entryPoint: null,
+          previewUrl: null,
+          totalAssets: 0,
+          detectedAssets: [],
+          blockers: [err.message || 'Failed to detect preview capabilities.'],
+        });
+      })
+      .finally(() => setPreviewLoading(false));
+  }, [metadata.owner, metadata.name, repoUrl, metadata.projectType]);
+
   const totalLangSize = Object.values(metadata.languages).reduce((a, b) => a + b, 0);
   const sortedLangs = Object.entries(metadata.languages).sort((a, b) => b[1] - a[1]);
   const validLangs = sortedLangs.filter(([_, size]) => totalLangSize > 0 && ((size / totalLangSize) * 100) >= 1);
   const topLangs = validLangs.slice(0, 5);
   const remainingLangs = sortedLangs.length - topLangs.length;
-  
+
   const topFolders = folderAnalysis.folderSummary.slice(0, 8);
   const remainingFolders = folderAnalysis.folderSummary.length - 8;
 
   const primaryLang = sortedLangs.length > 0 ? sortedLangs[0][0] : "None";
   const repoSizeStr = totalLangSize > 5000000 ? "Large" : (totalLangSize > 500000 ? "Medium" : "Small");
   const docStatus = (
-    folderAnalysis.importantFiles.some(f => f.toLowerCase().includes('readme')) || 
+    folderAnalysis.importantFiles.some(f => f.toLowerCase().includes('readme')) ||
     folderAnalysis.folderSummary.some(f => f.toLowerCase().includes('docs'))
   ) ? "Available" : "Missing";
+
+  const isPreviewReady = previewData?.status === 'READY';
 
   return (
     <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -51,7 +88,7 @@ export default function Dashboard({ data }: { data: AnalysisResponse }) {
               )}
             </div>
             <p className="text-sm font-medium text-slate-500 mt-2">{metadata.owner}/{metadata.name}</p>
-            
+
             {metadata.summary ? (
               <div className="mt-6 rounded-2xl bg-indigo-50/40 p-5 sm:p-6 border border-indigo-100/60 relative text-left">
                 <span className="absolute top-4 right-4 text-xl opacity-60">✨</span>
@@ -80,6 +117,77 @@ export default function Dashboard({ data }: { data: AnalysisResponse }) {
           </span>
         </div>
       </div>
+
+      {/* Live Static Preview Card (Phase 2 Feature) */}
+      <div className="rounded-3xl border border-slate-200 bg-white p-6 sm:p-7 shadow-sm lg:col-span-2">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-3">
+              <h2 className="text-xl font-semibold text-slate-900">Live Static Preview</h2>
+              {previewLoading ? (
+                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">
+                  <span className="h-2 w-2 animate-spin rounded-full border border-slate-400 border-t-transparent"></span>
+                  Checking capabilities...
+                </span>
+              ) : (
+                <PreviewBadge status={previewData?.status || 'UNKNOWN'} />
+              )}
+            </div>
+            <p className="text-sm text-slate-500 max-w-2xl">
+              {isPreviewReady
+                ? `Valid HTML entry point discovered (${previewData?.entryPoint}). You can preview this static website inside an isolated, secure sandbox.`
+                : previewData?.blockers && previewData.blockers.length > 0
+                ? previewData.blockers[0]
+                : 'Static preview is currently limited to plain HTML/CSS/JavaScript websites.'}
+            </p>
+          </div>
+
+          <div>
+            {isPreviewReady ? (
+              <button
+                type="button"
+                onClick={() => setIsModalOpen(true)}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm shadow-sm transition hover:shadow cursor-pointer"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Open Live Preview
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-100 text-slate-400 font-medium text-sm cursor-not-allowed border border-slate-200"
+              >
+                Preview Unavailable
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* If unsupported, show detailed blockers info */}
+        {!isPreviewReady && previewData?.blockers && previewData.blockers.length > 0 && (
+          <div className="mt-4 rounded-xl bg-slate-50 border border-slate-200/80 p-3.5 text-xs text-slate-600 flex items-start gap-2.5">
+            <span className="text-amber-500 text-base leading-none">ℹ️</span>
+            <div>
+              <p className="font-semibold text-slate-700">Why is static preview unavailable?</p>
+              <p className="mt-0.5">{previewData.blockers[0]}</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Modal Viewport */}
+      <StaticPreviewModal
+        isOpen={isModalOpen}
+        onClose={() => setIsModalOpen(false)}
+        previewUrl={previewData?.previewUrl || null}
+        repoName={metadata.name}
+        status={previewData?.status || 'UNSUPPORTED'}
+        blockers={previewData?.blockers || []}
+      />
 
       {/* Repository Insights Card */}
       <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">

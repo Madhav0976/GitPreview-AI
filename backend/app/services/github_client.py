@@ -282,6 +282,51 @@ async def fetch_file_content(
     return ""
 
 
+async def fetch_file_bytes(
+    owner: str,
+    repo_name: str,
+    file_path: str,
+    client: httpx.AsyncClient,
+    default_branch: str = "main",
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Fetch raw file bytes and ETag cleanly using GitHub contents API.
+    Returns (bytes, etag) or (None, None) if not found.
+    """
+    import base64
+    api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{file_path}"
+    try:
+        response = await client.get(api_url)
+        rate_limit_tracker.update_from_headers(response.headers)
+        etag = response.headers.get("etag")
+
+        if response.status_code == 200:
+            content_type = response.headers.get("content-type", "")
+            if content_type.startswith("application/json"):
+                data = response.json()
+                if isinstance(data, dict):
+                    if "content" in data and data.get("encoding") == "base64":
+                        return base64.b64decode(data["content"]), etag
+                    if data.get("type") == "file" and "download_url" in data:
+                        download_resp = await client.get(data["download_url"])
+                        rate_limit_tracker.update_from_headers(download_resp.headers)
+                        if download_resp.status_code == 200:
+                            return download_resp.content, download_resp.headers.get("etag") or etag
+                return None, None
+            return response.content, etag
+        elif response.status_code == 404:
+            return None, None
+
+        if response.status_code in (403, 429):
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{default_branch}/{file_path}"
+            raw_response = await client.get(raw_url)
+            if raw_response.status_code == 200:
+                return raw_response.content, raw_response.headers.get("etag")
+    except Exception as exc:
+        logger.debug("Error fetching bytes for %s in %s/%s: %s", file_path, owner, repo_name, exc)
+    return None, None
+
+
 async def fetch_repo_metadata(repo_url: str) -> Dict[str, Any]:
     """
     Fetch repository metadata using the tree-based approach.

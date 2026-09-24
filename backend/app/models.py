@@ -80,3 +80,23 @@ class RunAnalysisResponse(BaseModel):
     repo: str
     defaultBranch: str
     analysis: RunAnalysisResult
+
+
+# ==========================================
+# V2 Phase 2 Static Preview Models
+# ==========================================
+
+class PreviewDetectRequest(BaseModel):
+    """Request payload for static preview detection"""
+    repoUrl: HttpUrl
+
+
+class PreviewDetectResponse(BaseModel):
+    """Detection result for static website preview feasibility"""
+    status: str  # "READY" | "UNSUPPORTED"
+    category: str
+    entryPoint: Optional[str] = None
+    previewUrl: Optional[str] = None
+    totalAssets: int = 0
+    detectedAssets: List[str] = Field(default_factory=list)
+    blockers: List[str] = Field(default_factory=list)

@@ -11,10 +11,11 @@ from app.limiter import limiter
 from app.api.health import router as health_router
 from app.api.analyze import router as analyze_router
 from app.api.run_analysis import router as run_analysis_router
+from app.api.preview import router as preview_router
 
 app = FastAPI(
     title="GitPreview AI Backend",
-    description="API for repository analysis, metadata preview, and run analysis.",
+    description="API for repository analysis, metadata preview, run analysis, and safe static preview.",
     version="0.2.0",
 )
 
@@ -55,6 +56,7 @@ app.add_middleware(
 app.include_router(health_router, prefix="/api")
 app.include_router(analyze_router, prefix="/api")
 app.include_router(run_analysis_router, prefix="/api")
+app.include_router(preview_router, prefix="/api")
 
 
 @app.get("/", tags=["root"])
