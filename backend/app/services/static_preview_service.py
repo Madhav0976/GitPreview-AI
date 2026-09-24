@@ -919,7 +919,152 @@ def inject_base_tag_into_html(html_text: str, owner: str, repo: str, branch: str
         flags=re.IGNORECASE,
     )
 
-    # 2. Comprehensive client-side preview navigation script
+    # 2. Sandboxed Web Storage (localStorage / sessionStorage) compatibility shim
+    storage_shim_script = """<script id="__gitpreview_storage_shim">
+(function() {
+  function createMemoryStorage() {
+    var store = Object.create(null);
+    var storage = {
+      getItem: function(key) {
+        var k = String(key);
+        return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null;
+      },
+      setItem: function(key, value) {
+        var k = String(key);
+        var v = String(value);
+        store[k] = v;
+      },
+      removeItem: function(key) {
+        var k = String(key);
+        if (Object.prototype.hasOwnProperty.call(store, k)) {
+          delete store[k];
+        }
+      },
+      clear: function() {
+        store = Object.create(null);
+      },
+      key: function(index) {
+        var keys = Object.keys(store);
+        var n = Number(index) || 0;
+        return (n >= 0 && n < keys.length) ? keys[n] : null;
+      }
+    };
+    try {
+      Object.defineProperty(storage, 'length', {
+        get: function() {
+          return Object.keys(store).length;
+        },
+        enumerable: false,
+        configurable: true
+      });
+    } catch (e) {
+      storage.length = 0;
+    }
+    if (typeof Proxy === 'function') {
+      try {
+        return new Proxy(storage, {
+          get: function(target, prop) {
+            if (prop in target) {
+              var val = target[prop];
+              return typeof val === 'function' ? val.bind(target) : val;
+            }
+            if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(store, prop)) {
+              return store[prop];
+            }
+            return undefined;
+          },
+          set: function(target, prop, value) {
+            if (prop in target && prop !== 'length') {
+              target[prop] = value;
+              return true;
+            }
+            if (typeof prop === 'string') {
+              store[prop] = String(value);
+            }
+            return true;
+          },
+          deleteProperty: function(target, prop) {
+            if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(store, prop)) {
+              delete store[prop];
+            }
+            return true;
+          },
+          has: function(target, prop) {
+            return (prop in target) || (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(store, prop));
+          },
+          ownKeys: function() {
+            return Object.keys(store);
+          },
+          getOwnPropertyDescriptor: function(target, prop) {
+            if (typeof prop === 'string' && Object.prototype.hasOwnProperty.call(store, prop)) {
+              return {
+                value: store[prop],
+                writable: true,
+                enumerable: true,
+                configurable: true
+              };
+            }
+            return Object.getOwnPropertyDescriptor(target, prop);
+          }
+        });
+      } catch (e) {}
+    }
+    return storage;
+  }
+
+  function installStorageFallbackIfNeeded(propName) {
+    var usable = false;
+    try {
+      var nativeStorage = window[propName];
+      if (nativeStorage && typeof nativeStorage.getItem === 'function' && typeof nativeStorage.setItem === 'function') {
+        var testKey = '__gitpreview_storage_test__';
+        nativeStorage.setItem(testKey, '1');
+        nativeStorage.removeItem(testKey);
+        usable = true;
+      }
+    } catch (err) {
+      usable = false;
+    }
+
+    if (usable) return;
+
+    var fallback = createMemoryStorage();
+    try {
+      Object.defineProperty(window, propName, {
+        get: function() { return fallback; },
+        set: function() {},
+        configurable: true,
+        enumerable: true
+      });
+    } catch (e) {
+      try {
+        Object.defineProperty(window, propName, {
+          value: fallback,
+          configurable: true,
+          enumerable: true,
+          writable: true
+        });
+      } catch (e2) {}
+    }
+
+    try {
+      if (typeof Window !== 'undefined' && Window.prototype) {
+        Object.defineProperty(Window.prototype, propName, {
+          get: function() { return fallback; },
+          set: function() {},
+          configurable: true,
+          enumerable: true
+        });
+      }
+    } catch (e) {}
+  }
+
+  installStorageFallbackIfNeeded('localStorage');
+  installStorageFallbackIfNeeded('sessionStorage');
+})();
+</script>"""
+
+    # 3. Comprehensive client-side preview navigation script
     nav_script = f"""<script id="__gitpreview_nav_layer">
 (function() {{
   var baseHref = "{base_href}";
@@ -1230,7 +1375,7 @@ def inject_base_tag_into_html(html_text: str, owner: str, repo: str, branch: str
 }})();
 </script>"""
 
-    injection_block = f"\n  {base_tag}\n  {nav_script}\n"
+    injection_block = f"\n  {base_tag}\n  {storage_shim_script}\n  {nav_script}\n"
 
     # Insertion after <head>
     head_match = re.search(r"<head\b[^>]*>", processed_html, re.IGNORECASE)

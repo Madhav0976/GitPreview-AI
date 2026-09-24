@@ -646,7 +646,151 @@ class TestPortfolioNavigationEdgeCases(unittest.TestCase):
         self.assertIn("base href", resp2.text)
 
 
+class TestStorageCompatibilityShim(unittest.TestCase):
+    """
+    Regression tests for Web Storage (localStorage / sessionStorage) compatibility shim
+    inside opaque-origin sandboxed preview iframes (without allow-same-origin).
+    """
+
+    def test_storage_shim_injected_before_nav_layer_and_repo_scripts(self):
+        raw_html = (
+            '<!DOCTYPE html>\n'
+            '<html lang="en">\n'
+            '<head>\n'
+            '  <meta charset="UTF-8">\n'
+            '  <script defer src="script.js"></script>\n'
+            '</head>\n'
+            '<body><h1>Portfolio</h1></body>\n'
+            '</html>'
+        )
+        injected = inject_base_tag_into_html(
+            raw_html, "shahriar-tasnim", "shahriar-tasnim.github.io", "main", "index.html"
+        )
+
+        # A. Storage compatibility shim is injected
+        self.assertIn('id="__gitpreview_storage_shim"', injected)
+        # D. Navigation layer is still injected
+        self.assertIn('id="__gitpreview_nav_layer"', injected)
+
+        # B. Storage shim appears BEFORE __gitpreview_nav_layer and BEFORE repository script.js
+        shim_pos = injected.find('id="__gitpreview_storage_shim"')
+        nav_pos = injected.find('id="__gitpreview_nav_layer"')
+        repo_script_pos = injected.find('src="script.js"')
+
+        self.assertGreater(shim_pos, 0)
+        self.assertLess(shim_pos, nav_pos)
+        self.assertLess(nav_pos, repo_script_pos)
+
+    def test_storage_shim_contains_local_and_session_storage_fallbacks(self):
+        raw_html = "<html><head><title>Test</title></head><body></body></html>"
+        injected = inject_base_tag_into_html(
+            raw_html, "shahriar-tasnim", "shahriar-tasnim.github.io", "main", "index.html"
+        )
+
+        # C. Contains localStorage and sessionStorage fallback installation and Storage API methods
+        self.assertIn("installStorageFallbackIfNeeded('localStorage')", injected)
+        self.assertIn("installStorageFallbackIfNeeded('sessionStorage')", injected)
+        for method in ("getItem", "setItem", "removeItem", "clear", "key", "length"):
+            self.assertIn(method, injected)
+
+        # Ensure no unsafe storage mechanisms (cookies, indexedDB, postMessage) are introduced
+        shim_start = injected.find('<script id="__gitpreview_storage_shim">')
+        shim_end = injected.find("</script>", shim_start)
+        shim_code = injected[shim_start:shim_end]
+        self.assertNotIn("document.cookie", shim_code)
+        self.assertNotIn("indexedDB", shim_code)
+        self.assertNotIn("postMessage", shim_code)
+
+    def test_root_and_nested_entry_behavior_unchanged_with_storage_shim(self):
+        raw_html = '<html><head></head><body><a href="/about.html">About</a></body></html>'
+
+        # Root entry
+        root_injected = inject_base_tag_into_html(raw_html, "owner", "repo", "main", "index.html")
+        self.assertIn('<base href="/api/preview/owner/repo/main/">', root_injected)
+        self.assertIn('id="__gitpreview_storage_shim"', root_injected)
+        self.assertIn('id="__gitpreview_nav_layer"', root_injected)
+        self.assertIn('href="/api/preview/owner/repo/main/about.html"', root_injected)
+
+        # Nested entry
+        nested_injected = inject_base_tag_into_html(raw_html, "owner", "repo", "main", "public/index.html")
+        self.assertIn('<base href="/api/preview/owner/repo/main/public/">', nested_injected)
+        self.assertIn('id="__gitpreview_storage_shim"', nested_injected)
+        self.assertIn('id="__gitpreview_nav_layer"', nested_injected)
+        self.assertIn('href="/api/preview/owner/repo/main/about.html"', nested_injected)
+
+    def test_storage_shim_runtime_execution_in_opaque_sandbox_and_native_preservation(self):
+        import re
+        import shutil
+        import subprocess
+
+        if not shutil.which("node"):
+            self.skipTest("Node.js not available for JS runtime test")
+
+        raw_html = "<html><head></head><body></body></html>"
+        injected = inject_base_tag_into_html(raw_html, "owner", "repo", "main", "index.html")
+        match = re.search(r'<script id="__gitpreview_storage_shim">(.*?)</script>', injected, re.DOTALL)
+        self.assertIsNotNone(match)
+        shim_js = match.group(1)
+
+        node_script = f"""
+        // 1. Simulate opaque-origin sandbox where reading localStorage/sessionStorage throws SecurityError
+        function Window() {{}}
+        Object.defineProperty(Window.prototype, 'localStorage', {{
+          get: function() {{
+            var err = new Error("Failed to read 'localStorage' from 'Window': The document is sandboxed.");
+            err.name = 'SecurityError';
+            throw err;
+          }},
+          configurable: true
+        }});
+        Object.defineProperty(Window.prototype, 'sessionStorage', {{
+          get: function() {{
+            var err = new Error("Failed to read 'sessionStorage' from 'Window': The document is sandboxed.");
+            err.name = 'SecurityError';
+            throw err;
+          }},
+          configurable: true
+        }});
+        global.Window = Window;
+        global.window = new Window();
+
+        {shim_js}
+
+        const assert = require('assert');
+        assert.strictEqual(window.localStorage.getItem('portfolio-theme'), null);
+        window.localStorage.setItem('portfolio-theme', 'dark');
+        assert.strictEqual(window.localStorage.getItem('portfolio-theme'), 'dark');
+        window.localStorage.setItem('count', 42);
+        assert.strictEqual(window.localStorage.getItem('count'), '42');
+        assert.strictEqual(window.localStorage.length, 2);
+        assert.strictEqual(window.localStorage.key(0), 'portfolio-theme');
+        assert.strictEqual(window.localStorage.key(99), null);
+        window.localStorage.removeItem('count');
+        assert.strictEqual(window.localStorage.getItem('count'), null);
+        assert.strictEqual(window.localStorage.length, 1);
+        window.localStorage.clear();
+        assert.strictEqual(window.localStorage.length, 0);
+        assert.strictEqual(window.sessionStorage.getItem('missing'), null);
+
+        // 2. Verify working native storage is NOT overwritten
+        const nativeMock = {{
+          _isNative: true,
+          getItem: () => 'native_val',
+          setItem: () => {{}},
+          removeItem: () => {{}}
+        }};
+        global.window = {{ localStorage: nativeMock, sessionStorage: nativeMock }};
+        {shim_js}
+        assert.strictEqual(global.window.localStorage._isNative, true);
+        console.log("SHIM_RUNTIME_OK");
+        """
+        proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, 0, f"Node runtime test failed: {proc.stderr}")
+        self.assertIn("SHIM_RUNTIME_OK", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
