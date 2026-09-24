@@ -23,7 +23,11 @@ from app.services.cache import analysis_cache
 from app.services.static_preview_service import (
     resolve_entry_point,
     sanitize_and_validate_path,
+    classify_and_resolve_preview_url,
     inject_base_tag_into_html,
+    rewrite_css_urls,
+    render_diagnostic_html,
+    PreviewResolutionError,
     detect_static_preview,
     STATIC_MIME_TYPES,
     MAX_CODE_SIZE_BYTES,
@@ -313,8 +317,31 @@ class TestPreviewAPIEndpoints(unittest.TestCase):
             {"path": "index.html", "type": "blob"},
             {"path": "styles.css", "type": "blob"},
         ]
-        resp = self.client.get("/api/preview/mock/repo/main/missing_asset.png")
+        resp = self.client.get(
+            "/api/preview/mock/repo/main/missing_asset.png",
+            headers={"Accept": "application/json"}
+        )
         self.assertEqual(resp.status_code, 404)
+        data = resp.json()
+        self.assertIn("detail", data)
+        self.assertEqual(data.get("requestedTarget"), "missing_asset.png")
+        self.assertIn("suggestedFix", data)
+
+    @patch("app.api.preview.fetch_git_tree")
+    def test_serve_asset_missing_html_diagnostic(self, mock_tree):
+        mock_tree.return_value = [
+            {"path": "index.html", "type": "blob"},
+            {"path": "styles.css", "type": "blob"},
+        ]
+        resp = self.client.get(
+            "/api/preview/mock/repo/main/about.html",
+            headers={"Accept": "text/html"}
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("text/html", resp.headers.get("content-type", ""))
+        self.assertIn("Preview Resolution Error", resp.text)
+        self.assertIn("about.html", resp.text)
+        self.assertIn("Back to Preview Entry Point", resp.text)
 
     def test_serve_asset_invalid_coordinates(self):
         resp = self.client.get("/api/preview/mock/repo/main/../traversal.html")
@@ -325,5 +352,301 @@ class TestPreviewAPIEndpoints(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class TestPreviewUrlClassificationAndResolution(unittest.TestCase):
+    """Test comprehensive URL classification and target resolution for preview navigation."""
+
+    def setUp(self):
+        self.owner = "octocat"
+        self.repo = "portfolio"
+        self.branch = "main"
+        self.static_tree = {
+            "index.html",
+            "about.html",
+            "css/style.css",
+            "js/app.js",
+            "assets/logo.png",
+            "assets/resume.pdf",
+            "docs/guide.html",
+        }
+        self.spa_tree = {
+            "package.json",
+            "dist/index.html",
+            "dist/assets/index-abc.js",
+            "dist/assets/index-xyz.css",
+            "dist/favicon.ico",
+        }
+
+    def test_hash_links(self):
+        res = classify_and_resolve_preview_url(
+            "#about", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+        )
+        self.assertEqual(res["type"], "hash")
+        self.assertEqual(res["target"], "index.html")
+
+        res_root = classify_and_resolve_preview_url(
+            "#", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+        )
+        self.assertEqual(res_root["type"], "hash")
+
+    def test_external_links(self):
+        for ext_url in ["https://github.com/octocat", "http://example.com", "mailto:user@test.com", "tel:+1234567890"]:
+            with self.subTest(url=ext_url):
+                res = classify_and_resolve_preview_url(
+                    ext_url, self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+                )
+                self.assertEqual(res["type"], "external")
+                self.assertEqual(res["target"], ext_url)
+
+    def test_relative_static_links(self):
+        res = classify_and_resolve_preview_url(
+            "about.html", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+        )
+        self.assertEqual(res["type"], "static_asset")
+        self.assertEqual(res["target"], "about.html")
+
+        res_pdf = classify_and_resolve_preview_url(
+            "assets/resume.pdf", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+        )
+        self.assertEqual(res_pdf["type"], "static_asset")
+        self.assertEqual(res_pdf["target"], "assets/resume.pdf")
+
+    def test_absolute_repo_paths(self):
+        res = classify_and_resolve_preview_url(
+            "/about.html", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+        )
+        self.assertEqual(res["type"], "static_asset")
+        self.assertEqual(res["target"], "about.html")
+
+        res_css = classify_and_resolve_preview_url(
+            "/css/style.css", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+        )
+        self.assertEqual(res_css["type"], "static_asset")
+        self.assertEqual(res_css["target"], "css/style.css")
+
+    def test_clean_urls_extension_probing(self):
+        # /about -> about.html
+        res = classify_and_resolve_preview_url(
+            "/about", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+        )
+        self.assertEqual(res["type"], "static_asset")
+        self.assertEqual(res["target"], "about.html")
+
+    def test_spa_client_side_routing(self):
+        # In SPA repository with dist/index.html, unknown routes fall back to dist/index.html
+        for route in ["/about", "/projects", "/dashboard", "/users/42"]:
+            with self.subTest(route=route):
+                res = classify_and_resolve_preview_url(
+                    route, self.owner, self.repo, self.branch, self.spa_tree, "dist/index.html", is_spa=True
+                )
+                self.assertEqual(res["type"], "spa_route")
+                self.assertEqual(res["target"], "dist/index.html")
+
+    def test_plain_html_missing_route_raises_error(self):
+        # Plain static HTML repos must NOT blindly fall back to index.html
+        with self.assertRaises(PreviewResolutionError) as cm:
+            classify_and_resolve_preview_url(
+                "/non-existent-page", self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+            )
+        self.assertEqual(cm.exception.status_code, 404)
+        self.assertEqual(cm.exception.repository_type, "static_html")
+        self.assertFalse(cm.exception.exists)
+        self.assertIn("could not be found", cm.exception.reason)
+
+    def test_path_traversal_detection(self):
+        traversal_attempts = [
+            "../../etc/passwd",
+            "/../secret.txt",
+            "pages/../../index.html",
+        ]
+        for bad_path in traversal_attempts:
+            with self.subTest(path=bad_path):
+                with self.assertRaises(PreviewResolutionError) as cm:
+                    classify_and_resolve_preview_url(
+                        bad_path, self.owner, self.repo, self.branch, self.static_tree, "index.html", is_spa=False
+                    )
+                self.assertEqual(cm.exception.status_code, 400)
+
+
+class TestHtmlAndCssRewriting(unittest.TestCase):
+    """Test client-side navigation injection and CSS root-relative URL rewriting."""
+
+    def test_html_navigation_script_and_base_injected(self):
+        raw_html = '<html><head><title>Portfolio</title></head><body><a href="/about.html">About</a><a href="#contact">Contact</a></body></html>'
+        injected = inject_base_tag_into_html(raw_html, "octocat", "portfolio", "main", "index.html")
+
+        # 1. Base tag injected
+        self.assertIn('<base href="/api/preview/octocat/portfolio/main/">', injected)
+        # 2. Root-relative href rewritten
+        self.assertIn('href="/api/preview/octocat/portfolio/main/about.html"', injected)
+        # 3. Client navigation script injected
+        self.assertIn('__gitpreview_nav_layer', injected)
+        self.assertIn('scrollIntoView', injected)
+
+    def test_css_url_rewriting(self):
+        css_text = (
+            "body { background: url('/images/bg.png'); }\n"
+            ".icon { background-image: url(/icons/logo.svg); }\n"
+            ".remote { background: url('https://fonts.gstatic.com/s/roboto.woff2'); }\n"
+            ".relative { background: url('assets/local.png'); }"
+        )
+        rewritten = rewrite_css_urls(css_text, "octocat", "portfolio", "main")
+        self.assertIn("url('/api/preview/octocat/portfolio/main/images/bg.png')", rewritten)
+        self.assertIn("url('/api/preview/octocat/portfolio/main/icons/logo.svg')", rewritten)
+        self.assertIn("url('https://fonts.gstatic.com/s/roboto.woff2')", rewritten)
+        self.assertIn("url('assets/local.png')", rewritten)
+
+
+class TestSpaPrebuiltPreviewDetection(unittest.IsolatedAsyncioTestCase):
+    """Test that pre-built SPAs with dist/index.html or build/index.html are previewable."""
+
+    async def test_prebuilt_spa_detected_as_ready(self):
+        tree = [
+            {"path": "package.json", "type": "blob"},
+            {"path": "dist/index.html", "type": "blob"},
+            {"path": "dist/assets/index.js", "type": "blob"},
+            {"path": "dist/assets/index.css", "type": "blob"},
+        ]
+        pkg_content = json.dumps({
+            "name": "my-spa-portfolio",
+            "dependencies": {"react": "^18.0.0"}
+        })
+
+        with patch("app.services.static_preview_service.fetch_file_content", new_callable=AsyncMock) as mock_fetch:
+            mock_fetch.return_value = pkg_content
+            res = await detect_static_preview(
+                owner="octocat",
+                repo_name="my-spa-portfolio",
+                default_branch="main",
+                tree_entries=tree,
+                languages={"JavaScript": 100},
+                client=AsyncMock(),
+            )
+        self.assertEqual(res.status, "READY")
+        self.assertEqual(res.entryPoint, "dist/index.html")
+        self.assertIn("/api/preview/octocat/my-spa-portfolio/main/dist/index.html", res.previewUrl)
+
+
+class TestPortfolioNavigationEdgeCases(unittest.TestCase):
+    """
+    Direct regression tests for real-world portfolio navigation issues:
+    - Root and nested entry point base tags
+    - Root-relative and relative link rewriting
+    - Button click, data-href, and onclick proxying
+    - Location API (assign, replace, history.pushState) interception
+    - Clean URLs, hash variants, and media assets with spaces
+    """
+
+    def setUp(self):
+        self.client = TestClient(app)
+        self.owner = "abhijeetBhale"
+        self.repo = "Portfolio"
+        self.branch = "main"
+        self.tree_paths = {
+            "index.html",
+            "styles.css",
+            "script.js",
+            "about.html",
+            "projects.html",
+            "assets/logo.png",
+            "assets/Abhijeet Bhale UCV.pdf",
+            "public/index.html",
+            "public/about.html",
+            "public/styles.css",
+        }
+
+    def test_navigation_script_contains_all_resolvers(self):
+        html = '<html><head><title>Portfolio</title></head><body><button onclick="location.href=\'/about.html\'">About</button></body></html>'
+        injected = inject_base_tag_into_html(html, self.owner, self.repo, self.branch, "index.html")
+
+        self.assertIn("__gitpreview_nav_layer", injected)
+        self.assertIn("resolveNavUrl", injected)
+        self.assertIn("scrollToTarget", injected)
+        self.assertIn("Location.prototype.assign", injected)
+        self.assertIn("Location.prototype.replace", injected)
+        self.assertIn("history.pushState", injected)
+        self.assertIn("history.replaceState", injected)
+        self.assertIn("Location.prototype", injected)
+        self.assertIn("__gitpreview_resolve_nav_url", injected)
+
+    def test_nested_entry_point_base_href(self):
+        html = '<html><head><title>Nested App</title></head><body><a href="about.html">About</a></body></html>'
+        injected = inject_base_tag_into_html(html, self.owner, self.repo, self.branch, "public/index.html")
+
+        # Nested entry point must have public/ in base tag
+        self.assertIn('<base href="/api/preview/abhijeetBhale/Portfolio/main/public/">', injected)
+        self.assertIn('var repoRootHref = "/api/preview/abhijeetBhale/Portfolio/main/";', injected)
+
+    def test_root_entry_point_base_href(self):
+        html = '<html><head><title>Root App</title></head><body><a href="about.html">About</a></body></html>'
+        injected = inject_base_tag_into_html(html, self.owner, self.repo, self.branch, "index.html")
+
+        self.assertIn('<base href="/api/preview/abhijeetBhale/Portfolio/main/">', injected)
+
+    def test_button_and_data_href_attribute_rewriting(self):
+        html = (
+            '<html><head></head><body>'
+            '<button data-href="/projects">Projects</button>'
+            '<a data-target="/about.html">About</a>'
+            '<form action="/search" method="GET"></form>'
+            '</body></html>'
+        )
+        injected = inject_base_tag_into_html(html, self.owner, self.repo, self.branch, "index.html")
+        self.assertIn('data-href="/api/preview/abhijeetBhale/Portfolio/main/projects"', injected)
+        self.assertIn('data-target="/api/preview/abhijeetBhale/Portfolio/main/about.html"', injected)
+        self.assertIn('action="/api/preview/abhijeetBhale/Portfolio/main/search"', injected)
+
+    def test_clean_urls_extensionless_projects(self):
+        # /projects should resolve to projects.html
+        res = classify_and_resolve_preview_url(
+            "/projects", self.owner, self.repo, self.branch, self.tree_paths, "index.html", is_spa=False
+        )
+        self.assertEqual(res["type"], "static_asset")
+        self.assertEqual(res["target"], "projects.html")
+
+    def test_asset_with_spaces_resolved(self):
+        res = classify_and_resolve_preview_url(
+            "assets/Abhijeet Bhale UCV.pdf", self.owner, self.repo, self.branch, self.tree_paths, "index.html", is_spa=False
+        )
+        self.assertEqual(res["type"], "static_asset")
+        self.assertEqual(res["target"], "assets/Abhijeet Bhale UCV.pdf")
+
+        res_encoded = classify_and_resolve_preview_url(
+            "assets/Abhijeet%20Bhale%20UCV.pdf", self.owner, self.repo, self.branch, self.tree_paths, "index.html", is_spa=False
+        )
+        self.assertEqual(res_encoded["type"], "static_asset")
+        self.assertEqual(res_encoded["target"], "assets/Abhijeet Bhale UCV.pdf")
+
+    def test_hash_navigation_variants(self):
+        variants = ["#about", "./#about", "./index.html#about", "#projects", "#", "#top"]
+        for var in variants:
+            with self.subTest(var=var):
+                res = classify_and_resolve_preview_url(
+                    var, self.owner, self.repo, self.branch, self.tree_paths, "index.html", is_spa=False
+                )
+                self.assertEqual(res["type"], "hash")
+
+    @patch("app.api.preview.fetch_git_tree")
+    @patch("app.api.preview.fetch_file_bytes")
+    def test_root_preview_url_endpoints(self, mock_bytes, mock_tree):
+        mock_tree.return_value = [
+            {"path": "index.html", "type": "blob"},
+            {"path": "styles.css", "type": "blob"},
+        ]
+        mock_bytes.return_value = (b"<html><head><title>Portfolio</title></head><body>Hi</body></html>", '"etag1"')
+
+        # Test both /api/preview/{owner}/{repo}/{branch} and /api/preview/{owner}/{repo}/{branch}/
+        resp1 = self.client.get("/api/preview/mock/repo/main")
+        self.assertEqual(resp1.status_code, 200)
+        self.assertIn("text/html", resp1.headers.get("content-type", ""))
+        self.assertIn("base href", resp1.text)
+
+        resp2 = self.client.get("/api/preview/mock/repo/main/")
+        self.assertEqual(resp2.status_code, 200)
+        self.assertIn("text/html", resp2.headers.get("content-type", ""))
+        self.assertIn("base href", resp2.text)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

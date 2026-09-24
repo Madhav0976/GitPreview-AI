@@ -211,13 +211,13 @@ export default function StaticPreviewModal({
                 </div>
               ) : null}
 
-              {/* STRICTLY SANDBOXED IFRAME: NEVER ALLOW SAME ORIGIN */}
+              {/* STRICTLY SANDBOXED IFRAME: NEVER ALLOW SAME ORIGIN OR TOP NAVIGATION */}
               <iframe
                 key={iframeKey}
                 src={fullUrl}
                 title={`Live Preview of ${repoName}`}
                 className="w-full h-full border-0 bg-white"
-                sandbox="allow-scripts allow-forms"
+                sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
                 loading="eager"
                 referrerPolicy="no-referrer"
                 onLoad={() => setLoading(false)}
@@ -266,7 +266,7 @@ export default function StaticPreviewModal({
             <svg className="w-3.5 h-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
             </svg>
-            <span>Isolated Sandbox: <code className="font-mono text-slate-300">allow-scripts allow-forms</code> (opaque null origin; no-same-origin)</span>
+            <span>Isolated Sandbox: <code className="font-mono text-slate-300">allow-scripts allow-forms allow-popups</code> (opaque null origin; no-same-origin)</span>
           </div>
           <span className="text-slate-400">Zero backend execution • Read-only proxy</span>
         </div>
