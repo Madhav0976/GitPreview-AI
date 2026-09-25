@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from dataclasses import dataclass
 import logging
 import os
@@ -9,6 +10,8 @@ from typing import Dict, Any, Tuple, List, Optional
 from urllib.parse import urlparse, unquote
 
 import httpx
+
+from app.services.cache import github_api_cache
 
 logger = logging.getLogger(__name__)
 
@@ -188,26 +191,63 @@ def parse_repo_url(repo_url: str) -> Tuple[str, str]:
     return owner, repo_name
 
 
+class _UncacheableGitHubResult(Exception):
+    """Internal sentinel exception to prevent caching transient GitHub fetch failures while returning fallback values."""
+
+    def __init__(self, fallback_value: Any):
+        super().__init__("Uncacheable GitHub API fallback result")
+        self.fallback_value = fallback_value
+
+
+def _repo_cache_key(namespace: str, owner: str, repo_name: str) -> str:
+    return f"gh:{namespace}:{owner.strip().lower()}/{repo_name.strip().lower()}"
+
+
+def _branch_cache_key(namespace: str, owner: str, repo_name: str, branch: str) -> str:
+    return f"gh:{namespace}:{owner.strip().lower()}/{repo_name.strip().lower()}@{branch.strip()}"
+
+
+def _file_cache_key(namespace: str, owner: str, repo_name: str, branch: str, file_path: str) -> str:
+    clean_path = file_path.strip().lstrip("/")
+    return f"gh:{namespace}:{owner.strip().lower()}/{repo_name.strip().lower()}@{branch.strip()}:{clean_path}"
+
+
 async def fetch_repo_info(owner: str, repo_name: str, client: httpx.AsyncClient) -> Dict[str, Any]:
-    """Fetch core repository metadata from GitHub REST API."""
-    url = f"{GITHUB_API_BASE}/{owner}/{repo_name}"
-    response = await client.get(url)
-    rate_limit_tracker.update_from_headers(response.headers)
-    response.raise_for_status()
-    return response.json()
+    """Fetch core repository metadata from GitHub REST API with single-flight TTL caching."""
+    cache_key = _repo_cache_key("repo_info", owner, repo_name)
+
+    async def _compute() -> Dict[str, Any]:
+        url = f"{GITHUB_API_BASE}/{owner}/{repo_name}"
+        response = await client.get(url)
+        rate_limit_tracker.update_from_headers(response.headers)
+        response.raise_for_status()
+        return response.json()
+
+    result = await github_api_cache.get_or_compute_by_key(cache_key, _compute)
+    return copy.deepcopy(result)
 
 
 async def fetch_languages(owner: str, repo_name: str, client: httpx.AsyncClient) -> Dict[str, int]:
-    """Fetch repository language breakdown."""
-    url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/languages"
+    """Fetch repository language breakdown with single-flight TTL caching."""
+    cache_key = _repo_cache_key("languages", owner, repo_name)
+
+    async def _compute() -> Dict[str, int]:
+        url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/languages"
+        try:
+            response = await client.get(url)
+            rate_limit_tracker.update_from_headers(response.headers)
+            if response.status_code == 200:
+                return response.json() or {}
+        except Exception as e:
+            logger.warning("Failed to fetch languages for %s/%s: %s", owner, repo_name, e)
+            raise _UncacheableGitHubResult({}) from e
+        raise _UncacheableGitHubResult({})
+
     try:
-        response = await client.get(url)
-        rate_limit_tracker.update_from_headers(response.headers)
-        if response.status_code == 200:
-            return response.json() or {}
-    except Exception as e:
-        logger.warning("Failed to fetch languages for %s/%s: %s", owner, repo_name, e)
-    return {}
+        result = await github_api_cache.get_or_compute_by_key(cache_key, _compute)
+        return copy.deepcopy(result)
+    except _UncacheableGitHubResult as exc:
+        return exc.fallback_value
 
 
 async def fetch_git_tree(
@@ -219,22 +259,33 @@ async def fetch_git_tree(
     """
     Fetch the entire repository tree recursively using the GitHub Git Trees API.
     Returns list of tree entries with 'path' and 'type' ('blob' or 'tree').
+    Cached per (owner, repo, branch) with single-flight coalescing.
     """
-    url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/git/trees/{branch}?recursive=1"
+    cache_key = _branch_cache_key("git_tree", owner, repo_name, branch)
+
+    async def _compute() -> List[Dict[str, Any]]:
+        url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/git/trees/{branch}?recursive=1"
+        try:
+            response = await client.get(url)
+            rate_limit_tracker.update_from_headers(response.headers)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, dict) and "tree" in data:
+                    return data["tree"]
+            elif response.status_code in (404, 409):
+                logger.info("Git tree not available for %s/%s at branch %s (status %s)", owner, repo_name, branch, response.status_code)
+            else:
+                logger.warning("Unexpected status %s fetching git tree for %s/%s", response.status_code, owner, repo_name)
+        except Exception as e:
+            logger.warning("Exception fetching git tree for %s/%s: %s", owner, repo_name, e)
+            raise _UncacheableGitHubResult([]) from e
+        raise _UncacheableGitHubResult([])
+
     try:
-        response = await client.get(url)
-        rate_limit_tracker.update_from_headers(response.headers)
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, dict) and "tree" in data:
-                return data["tree"]
-        elif response.status_code in (404, 409):
-            logger.info("Git tree not available for %s/%s at branch %s (status %s)", owner, repo_name, branch, response.status_code)
-        else:
-            logger.warning("Unexpected status %s fetching git tree for %s/%s", response.status_code, owner, repo_name)
-    except Exception as e:
-        logger.warning("Exception fetching git tree for %s/%s: %s", owner, repo_name, e)
-    return []
+        result = await github_api_cache.get_or_compute_by_key(cache_key, _compute)
+        return copy.deepcopy(result)
+    except _UncacheableGitHubResult as exc:
+        return exc.fallback_value
 
 
 async def fetch_file_content(
@@ -247,39 +298,57 @@ async def fetch_file_content(
     """
     Fetch file content cleanly using GitHub contents API.
     Returns empty string immediately on 404 without noisy fallbacks.
+    Cached per (owner, repo, default_branch, file_path) with single-flight coalescing.
     """
-    api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{file_path}"
-    try:
-        response = await client.get(api_url)
-        rate_limit_tracker.update_from_headers(response.headers)
-        if response.status_code == 200:
-            content_type = response.headers.get("content-type", "")
-            if content_type.startswith("application/json"):
-                data = response.json()
-                if isinstance(data, dict):
-                    if "content" in data and data.get("encoding") == "base64":
-                        import base64
-                        return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-                    if data.get("type") == "file" and "download_url" in data:
-                        download_resp = await client.get(data["download_url"])
-                        rate_limit_tracker.update_from_headers(download_resp.headers)
-                        if download_resp.status_code == 200:
-                            return download_resp.text
-                return ""
-            return response.text
-        elif response.status_code == 404:
-            # File legitimately does not exist: return immediately. NO raw fallback.
-            return ""
+    clean_file_path = file_path.strip().lstrip("/")
+    cache_key = _file_cache_key("file_content", owner, repo_name, default_branch, clean_file_path)
 
-        # For 403/429 rate limit errors or other status codes on public repos, try raw content fallback
-        if response.status_code in (403, 429):
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{default_branch}/{file_path}"
-            raw_response = await client.get(raw_url)
-            if raw_response.status_code == 200:
-                return raw_response.text
-    except Exception as exc:
-        logger.debug("Error fetching %s for %s/%s: %s", file_path, owner, repo_name, exc)
-    return ""
+    async def _compute() -> str:
+        import urllib.parse
+        encoded_path = urllib.parse.quote(clean_file_path)
+        encoded_ref = urllib.parse.quote(default_branch.strip())
+        api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{encoded_path}?ref={encoded_ref}"
+        try:
+            response = await client.get(api_url)
+            rate_limit_tracker.update_from_headers(response.headers)
+            if response.status_code == 200:
+                content_type = response.headers.get("content-type", "")
+                if content_type.startswith("application/json"):
+                    data = response.json()
+                    if isinstance(data, dict):
+                        if "content" in data and data.get("encoding") == "base64":
+                            import base64
+                            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+                        if data.get("type") == "file" and "download_url" in data:
+                            download_resp = await client.get(data["download_url"])
+                            rate_limit_tracker.update_from_headers(download_resp.headers)
+                            if download_resp.status_code == 200:
+                                return download_resp.text
+                            raise _UncacheableGitHubResult("")
+                    return ""
+                return response.text
+            elif response.status_code == 404:
+                # File legitimately does not exist on this branch: return "" and cache 404 miss.
+                return ""
+
+            # For 403/429 rate limit errors on public repos, try raw content fallback
+            if response.status_code in (403, 429):
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{encoded_ref}/{encoded_path}"
+                raw_response = await client.get(raw_url)
+                if raw_response.status_code == 200:
+                    return raw_response.text
+        except _UncacheableGitHubResult:
+            raise
+        except Exception as exc:
+            logger.debug("Error fetching %s for %s/%s: %s", file_path, owner, repo_name, exc)
+            raise _UncacheableGitHubResult("") from exc
+
+        raise _UncacheableGitHubResult("")
+
+    try:
+        return await github_api_cache.get_or_compute_by_key(cache_key, _compute)
+    except _UncacheableGitHubResult as exc:
+        return exc.fallback_value
 
 
 async def fetch_file_bytes(
@@ -292,45 +361,58 @@ async def fetch_file_bytes(
     """
     Fetch raw file bytes and ETag cleanly using GitHub contents API.
     Returns (bytes, etag) or (None, None) if not found.
+    Cached per (owner, repo, default_branch, file_path) with single-flight coalescing.
     """
     import base64
     import urllib.parse
 
     clean_file_path = file_path.lstrip("/")
-    encoded_path = urllib.parse.quote(clean_file_path)
-    encoded_ref = urllib.parse.quote(default_branch)
-    api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{encoded_path}?ref={encoded_ref}"
+    cache_key = _file_cache_key("file_bytes", owner, repo_name, default_branch, clean_file_path)
+
+    async def _compute() -> Tuple[bytes, Optional[str]]:
+        encoded_path = urllib.parse.quote(clean_file_path)
+        encoded_ref = urllib.parse.quote(default_branch)
+        api_url = f"{GITHUB_API_BASE}/{owner}/{repo_name}/contents/{encoded_path}?ref={encoded_ref}"
+        try:
+            response = await client.get(api_url)
+            rate_limit_tracker.update_from_headers(response.headers)
+            etag = response.headers.get("etag")
+
+            if response.status_code == 200:
+                content_type = response.headers.get("content-type", "")
+                if content_type.startswith("application/json"):
+                    data = response.json()
+                    if isinstance(data, dict):
+                        if "content" in data and data.get("encoding") == "base64":
+                            clean_base64 = data["content"].replace("\n", "").replace("\r", "")
+                            return base64.b64decode(clean_base64), etag
+                        if data.get("type") == "file" and "download_url" in data:
+                            download_resp = await client.get(data["download_url"])
+                            rate_limit_tracker.update_from_headers(download_resp.headers)
+                            if download_resp.status_code == 200:
+                                return download_resp.content, download_resp.headers.get("etag") or etag
+                    raise _UncacheableGitHubResult((None, None))
+                return response.content, etag
+            elif response.status_code == 404:
+                raise _UncacheableGitHubResult((None, None))
+
+            if response.status_code in (403, 429):
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{encoded_ref}/{encoded_path}"
+                raw_response = await client.get(raw_url)
+                if raw_response.status_code == 200:
+                    return raw_response.content, raw_response.headers.get("etag")
+        except _UncacheableGitHubResult:
+            raise
+        except Exception as exc:
+            logger.debug("Error fetching bytes for %s in %s/%s: %s", file_path, owner, repo_name, exc)
+            raise _UncacheableGitHubResult((None, None)) from exc
+
+        raise _UncacheableGitHubResult((None, None))
+
     try:
-        response = await client.get(api_url)
-        rate_limit_tracker.update_from_headers(response.headers)
-        etag = response.headers.get("etag")
-
-        if response.status_code == 200:
-            content_type = response.headers.get("content-type", "")
-            if content_type.startswith("application/json"):
-                data = response.json()
-                if isinstance(data, dict):
-                    if "content" in data and data.get("encoding") == "base64":
-                        clean_base64 = data["content"].replace("\n", "").replace("\r", "")
-                        return base64.b64decode(clean_base64), etag
-                    if data.get("type") == "file" and "download_url" in data:
-                        download_resp = await client.get(data["download_url"])
-                        rate_limit_tracker.update_from_headers(download_resp.headers)
-                        if download_resp.status_code == 200:
-                            return download_resp.content, download_resp.headers.get("etag") or etag
-                return None, None
-            return response.content, etag
-        elif response.status_code == 404:
-            return None, None
-
-        if response.status_code in (403, 429):
-            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{encoded_ref}/{encoded_path}"
-            raw_response = await client.get(raw_url)
-            if raw_response.status_code == 200:
-                return raw_response.content, raw_response.headers.get("etag")
-    except Exception as exc:
-        logger.debug("Error fetching bytes for %s in %s/%s: %s", file_path, owner, repo_name, exc)
-    return None, None
+        return await github_api_cache.get_or_compute_by_key(cache_key, _compute)
+    except _UncacheableGitHubResult as exc:
+        return exc.fallback_value
 
 
 async def fetch_repo_metadata(repo_url: str) -> Dict[str, Any]:

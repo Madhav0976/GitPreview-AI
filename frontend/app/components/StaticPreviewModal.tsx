@@ -14,6 +14,8 @@ interface StaticPreviewModalProps {
 
 type DeviceMode = 'desktop' | 'tablet' | 'mobile'
 
+const IFRAME_LOAD_TIMEOUT_MS = 15000
+
 export default function StaticPreviewModal({
   isOpen,
   onClose,
@@ -31,6 +33,16 @@ export default function StaticPreviewModal({
   const isReady = status === 'READY' && !!previewUrl
   const fullUrl = resolvePreviewUrl(previewUrl)
 
+  // 1. Lock background body scroll while modal is open and restore on close/unmount (UX-05)
+  useEffect(() => {
+    if (!isOpen || typeof document === 'undefined') return
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = previousOverflow
+    }
+  }, [isOpen])
+
   useEffect(() => {
     if (isOpen) {
       setLoading(true)
@@ -38,6 +50,20 @@ export default function StaticPreviewModal({
       setIframeKey((prev) => prev + 1)
     }
   }, [isOpen, previewUrl])
+
+  // 2. Iframe loading timeout guard (~15 seconds) so a stalled request never spins forever (UX-05)
+  useEffect(() => {
+    if (!isOpen || !isReady || !loading) return
+
+    const timer = setTimeout(() => {
+      setLoading(false)
+      setError(
+        'The static preview is taking longer than expected to respond. You can retry loading or open the preview in a new tab.'
+      )
+    }, IFRAME_LOAD_TIMEOUT_MS)
+
+    return () => clearTimeout(timer)
+  }, [isOpen, isReady, loading, iframeKey])
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -59,6 +85,11 @@ export default function StaticPreviewModal({
     setIframeKey((prev) => prev + 1)
   }
 
+  function handleOpenNewTab() {
+    if (!fullUrl || typeof window === 'undefined') return
+    window.open(fullUrl, '_blank', 'noopener,noreferrer')
+  }
+
   function getViewportWidth() {
     switch (device) {
       case 'mobile':
@@ -72,7 +103,12 @@ export default function StaticPreviewModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-2 sm:p-4">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="static-preview-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-2 sm:p-4"
+    >
       <div
         className={`flex flex-col bg-slate-950 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden transition-all duration-300 ${
           isFullscreen
@@ -84,7 +120,7 @@ export default function StaticPreviewModal({
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-slate-900/90 px-4 py-3 text-white">
           <div className="flex items-center gap-2 min-w-0">
             <span className="flex h-2.5 w-2.5 rounded-full bg-emerald-500"></span>
-            <h3 className="text-sm font-semibold truncate">
+            <h3 id="static-preview-modal-title" className="text-sm font-semibold truncate">
               Preview: <span className="text-slate-300">{repoName}</span>
             </h3>
             {previewUrl && (
@@ -138,10 +174,25 @@ export default function StaticPreviewModal({
 
           {/* Control Actions */}
           <div className="flex items-center gap-2">
+            {isReady && fullUrl && (
+              <button
+                type="button"
+                onClick={handleOpenNewTab}
+                aria-label="Open preview in new tab"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 hover:text-white border border-slate-700 rounded-lg transition"
+                title="Open preview in new tab"
+              >
+                <span>Open in New Tab</span>
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+              </button>
+            )}
             {isReady && (
               <button
                 type="button"
                 onClick={handleReload}
+                aria-label="Reload preview"
                 className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition"
                 title="Reload preview"
               >
@@ -153,6 +204,7 @@ export default function StaticPreviewModal({
             <button
               type="button"
               onClick={() => setIsFullscreen(!isFullscreen)}
+              aria-label={isFullscreen ? 'Exit Fullscreen' : 'Enter Fullscreen'}
               className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition"
               title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
             >
@@ -169,6 +221,7 @@ export default function StaticPreviewModal({
             <button
               type="button"
               onClick={onClose}
+              aria-label="Close preview modal"
               className="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition"
               title="Close modal (Esc)"
             >
@@ -201,13 +254,24 @@ export default function StaticPreviewModal({
                   </div>
                   <h4 className="text-sm font-semibold text-slate-900">Preview Load Error</h4>
                   <p className="mt-1 text-xs text-slate-500 max-w-sm">{error}</p>
-                  <button
-                    type="button"
-                    onClick={handleReload}
-                    className="mt-4 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 rounded-md transition"
-                  >
-                    Try Again
-                  </button>
+                  <div className="mt-4 flex flex-wrap items-center justify-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={handleReload}
+                      className="px-3.5 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 rounded-md transition"
+                    >
+                      Retry
+                    </button>
+                    {fullUrl && (
+                      <button
+                        type="button"
+                        onClick={handleOpenNewTab}
+                        className="px-3.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-md transition"
+                      >
+                        Open in New Tab
+                      </button>
+                    )}
+                  </div>
                 </div>
               ) : null}
 
@@ -220,7 +284,10 @@ export default function StaticPreviewModal({
                 sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
                 loading="eager"
                 referrerPolicy="no-referrer"
-                onLoad={() => setLoading(false)}
+                onLoad={() => {
+                  setLoading(false)
+                  setError(null)
+                }}
                 onError={() => {
                   setLoading(false)
                   setError('Failed to load preview asset from repository.')

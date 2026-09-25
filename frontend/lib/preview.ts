@@ -2,6 +2,8 @@
  * Static Preview Client API (GitPreview-AI V2 - Phase 2)
  */
 
+import { getApiBase } from './api';
+
 export interface PreviewDetectResponse {
   status: 'READY' | 'UNSUPPORTED' | 'NEEDS_ENV' | 'NEEDS_EXTERNAL_SERVICE' | 'UNKNOWN' | string;
   category: string;
@@ -12,23 +14,54 @@ export interface PreviewDetectResponse {
   blockers: string[];
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'https://gitpreview-ai-backend.onrender.com/api';
+const PREVIEW_DETECT_TIMEOUT_MS = 30000;
 
-export async function detectPreview(repoUrl: string): Promise<PreviewDetectResponse> {
-  const response = await fetch(`${API_BASE}/preview/detect`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ repoUrl }),
-  });
+export async function detectPreview(
+  repoUrl: string,
+  externalSignal?: AbortSignal
+): Promise<PreviewDetectResponse> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), PREVIEW_DETECT_TIMEOUT_MS);
 
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.detail || 'Static preview detection failed');
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      clearTimeout(timeoutId);
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
   }
 
-  return response.json();
+  try {
+    const response = await fetch(`${getApiBase()}/preview/detect`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ repoUrl }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || 'Static preview detection failed');
+    }
+
+    return await response.json();
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      if (externalSignal?.aborted) {
+        throw err;
+      }
+      throw new Error('Static preview detection timed out. Please try again.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', onExternalAbort);
+    }
+  }
 }
 
 export function resolvePreviewUrl(previewPath: string | null): string {
@@ -37,7 +70,8 @@ export function resolvePreviewUrl(previewPath: string | null): string {
     return previewPath;
   }
   // Strip trailing /api to attach the full preview path like /api/preview/...
-  const baseOrigin = API_BASE.replace(/\/api\/?$/, '');
+  const baseOrigin = getApiBase().replace(/\/api\/?$/, '');
   const cleanPath = previewPath.startsWith('/') ? previewPath : `/${previewPath}`;
   return `${baseOrigin}${cleanPath}`;
 }
+

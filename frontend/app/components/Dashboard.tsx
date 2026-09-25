@@ -1,7 +1,8 @@
 "use client"
 
 import { useState, useEffect } from 'react'
-import type { AnalysisResponse } from '@/lib/types'
+import type { AnalysisResponse, RunAnalysisResult } from '@/lib/types'
+import { fetchRunAnalysis } from '@/lib/api'
 import { detectPreview, type PreviewDetectResponse } from '@/lib/preview'
 import PreviewBadge from './PreviewBadge'
 import StaticPreviewModal from './StaticPreviewModal'
@@ -16,6 +17,41 @@ function getTechColor(tech: string) {
   if (t.includes('next.js')) return 'bg-slate-800 text-white ring-slate-900/20';
   if (t.includes('node.js') || t.includes('javascript')) return 'bg-yellow-100 text-yellow-800 ring-yellow-600/20';
   return 'bg-slate-100 text-slate-800 ring-slate-500/20';
+}
+
+function getRunFeasibilityBadge(feasibility: string) {
+  switch (feasibility) {
+    case 'READY':
+      return {
+        label: 'Ready to Run',
+        classes: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+        dotClasses: 'bg-emerald-500',
+      };
+    case 'NEEDS_ENV':
+      return {
+        label: 'Needs Env Variables',
+        classes: 'bg-amber-50 text-amber-700 border-amber-200',
+        dotClasses: 'bg-amber-500',
+      };
+    case 'NEEDS_EXTERNAL_SERVICE':
+      return {
+        label: 'Needs External Services',
+        classes: 'bg-purple-50 text-purple-700 border-purple-200',
+        dotClasses: 'bg-purple-500',
+      };
+    case 'UNSUPPORTED':
+      return {
+        label: 'Unsupported / Non-App',
+        classes: 'bg-slate-100 text-slate-600 border-slate-200',
+        dotClasses: 'bg-slate-400',
+      };
+    default:
+      return {
+        label: feasibility || 'Unknown',
+        classes: 'bg-slate-100 text-slate-600 border-slate-200',
+        dotClasses: 'bg-slate-400',
+      };
+  }
 }
 
 function formatNumber(num: number) {
@@ -35,13 +71,33 @@ export default function Dashboard({ data, repoUrl }: DashboardProps) {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
 
-  useEffect(() => {
-    const targetUrl = repoUrl || `https://github.com/${metadata.owner}/${metadata.name}`;
-    setPreviewLoading(true);
+  const [runAnalysisData, setRunAnalysisData] = useState<RunAnalysisResult | null>(null);
+  const [runAnalysisLoading, setRunAnalysisLoading] = useState(false);
+  const [runAnalysisError, setRunAnalysisError] = useState<string | null>(null);
+  const [copiedCommandKey, setCopiedCommandKey] = useState<string | null>(null);
 
-    detectPreview(targetUrl)
-      .then((res) => setPreviewData(res))
+  useEffect(() => {
+    const controller = new AbortController();
+    const targetUrl = `https://github.com/${metadata.owner}/${metadata.name}`;
+
+    setPreviewLoading(true);
+    setPreviewData(null);
+
+    setRunAnalysisLoading(true);
+    setRunAnalysisData(null);
+    setRunAnalysisError(null);
+    setCopiedCommandKey(null);
+
+    detectPreview(targetUrl, controller.signal)
+      .then((res) => {
+        if (!controller.signal.aborted) {
+          setPreviewData(res);
+        }
+      })
       .catch((err) => {
+        if (err?.name === 'AbortError' || controller.signal.aborted) {
+          return;
+        }
         setPreviewData({
           status: 'UNSUPPORTED',
           category: metadata.projectType || 'unknown',
@@ -52,8 +108,52 @@ export default function Dashboard({ data, repoUrl }: DashboardProps) {
           blockers: [err.message || 'Failed to detect preview capabilities.'],
         });
       })
-      .finally(() => setPreviewLoading(false));
-  }, [metadata.owner, metadata.name, repoUrl, metadata.projectType]);
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setPreviewLoading(false);
+        }
+      });
+
+    fetchRunAnalysis({ repoUrl: targetUrl }, controller.signal)
+      .then((res) => {
+        if (!controller.signal.aborted) {
+          setRunAnalysisData(res.analysis);
+        }
+      })
+      .catch((err) => {
+        if (err?.name === 'AbortError' || controller.signal.aborted) {
+          return;
+        }
+        setRunAnalysisError(err.message || 'Failed to analyze repository run configuration.');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setRunAnalysisLoading(false);
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [metadata.owner, metadata.name, metadata.projectType]);
+
+  function handleCopyCommand(key: string, commandText: string) {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard
+          .writeText(commandText)
+          .then(() => {
+            setCopiedCommandKey(key);
+            setTimeout(() => {
+              setCopiedCommandKey((prev) => (prev === key ? null : prev));
+            }, 2000);
+          })
+          .catch(() => {});
+      }
+    } catch {
+      // Ignore clipboard failures gracefully
+    }
+  }
 
   const totalLangSize = Object.values(metadata.languages).reduce((a, b) => a + b, 0);
   const sortedLangs = Object.entries(metadata.languages).sort((a, b) => b[1] - a[1]);
@@ -188,6 +288,162 @@ export default function Dashboard({ data, repoUrl }: DashboardProps) {
         status={previewData?.status || 'UNSUPPORTED'}
         blockers={previewData?.blockers || []}
       />
+
+      {/* Run & Execution Analysis Card (V2 Phase 1 Feature - UX-01) */}
+      <div className="rounded-3xl border border-slate-200 bg-white p-6 sm:p-7 shadow-sm lg:col-span-2">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="text-xl font-semibold text-slate-900">Run &amp; Execution Analysis</h2>
+            {runAnalysisLoading ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-500">
+                <span className="h-2 w-2 animate-spin rounded-full border border-slate-400 border-t-transparent"></span>
+                Inspecting run configuration...
+              </span>
+            ) : runAnalysisData ? (
+              (() => {
+                const badge = getRunFeasibilityBadge(runAnalysisData.feasibility);
+                return (
+                  <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${badge.classes}`}>
+                    <span className={`h-1.5 w-1.5 rounded-full ${badge.dotClasses}`}></span>
+                    {badge.label}
+                  </span>
+                );
+              })()
+            ) : null}
+          </div>
+          {runAnalysisData?.workingDirectory && runAnalysisData.workingDirectory !== '.' && (
+            <span className="inline-flex items-center gap-1.5 rounded-lg bg-slate-100 px-2.5 py-1 text-xs font-mono text-slate-600">
+              workdir: {runAnalysisData.workingDirectory}
+            </span>
+          )}
+        </div>
+
+        {runAnalysisError ? (
+          <p className="mt-3 text-sm text-slate-500">{runAnalysisError}</p>
+        ) : runAnalysisData ? (
+          <div className="mt-5 space-y-5">
+            {/* Core Runtime Metadata */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+              <div className="flex flex-col border-l-2 border-blue-100 pl-3">
+                <span className="text-slate-500 font-medium mb-1">Runtime</span>
+                <span className="text-slate-900 font-semibold">{runAnalysisData.runtime || 'Not detected'}</span>
+              </div>
+              <div className="flex flex-col border-l-2 border-blue-100 pl-3">
+                <span className="text-slate-500 font-medium mb-1">Package Manager</span>
+                <span className="text-slate-900 font-semibold">{runAnalysisData.packageManager || 'None'}</span>
+              </div>
+              <div className="flex flex-col border-l-2 border-blue-100 pl-3">
+                <span className="text-slate-500 font-medium mb-1">Application Port</span>
+                <span className="text-slate-900 font-semibold">
+                  {runAnalysisData.expectedPort !== null && runAnalysisData.expectedPort !== undefined
+                    ? `:${runAnalysisData.expectedPort}`
+                    : 'Not specified'}
+                </span>
+              </div>
+              <div className="flex flex-col border-l-2 border-blue-100 pl-3">
+                <span className="text-slate-500 font-medium mb-1">Run Status</span>
+                <span className="text-slate-900 font-semibold">{runAnalysisData.feasibility}</span>
+              </div>
+            </div>
+
+            {/* Detected Commands (Install / Build / Start) */}
+            {(runAnalysisData.installCommand || runAnalysisData.buildCommand || runAnalysisData.startCommand) && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {[
+                  { key: 'install', label: 'Install Command', cmd: runAnalysisData.installCommand },
+                  { key: 'build', label: 'Build Command', cmd: runAnalysisData.buildCommand },
+                  { key: 'start', label: 'Start Command', cmd: runAnalysisData.startCommand },
+                ]
+                  .filter((item): item is { key: string; label: string; cmd: string } => Boolean(item.cmd))
+                  .map((item) => (
+                    <div
+                      key={item.key}
+                      className="rounded-2xl border border-slate-200 bg-slate-50/80 p-3.5 flex flex-col justify-between gap-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                          {item.label}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyCommand(item.key, item.cmd)}
+                          className="inline-flex items-center gap-1 rounded-md bg-white px-2 py-1 text-xs font-medium text-slate-600 border border-slate-200 hover:bg-slate-100 transition"
+                        >
+                          {copiedCommandKey === item.key ? '✓ Copied' : 'Copy'}
+                        </button>
+                      </div>
+                      <code className="block rounded-xl bg-slate-900 px-3 py-2 text-xs sm:text-sm font-mono text-slate-100 overflow-x-auto">
+                        {item.cmd}
+                      </code>
+                    </div>
+                  ))}
+              </div>
+            )}
+
+            {/* Required Environment Variables & External Services */}
+            {(runAnalysisData.requiredEnvVars.length > 0 || runAnalysisData.externalServices.length > 0) && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+                {runAnalysisData.requiredEnvVars.length > 0 && (
+                  <div className="rounded-2xl border border-amber-200/80 bg-amber-50/40 p-4">
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-amber-800">
+                        Required Environment Variables ({runAnalysisData.requiredEnvVars.length})
+                      </h3>
+                    </div>
+                    <p className="text-xs text-amber-700/90 mb-2.5">
+                      Variable names detected from repository template files. Secret values are never accessed or exposed.
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {runAnalysisData.requiredEnvVars.map((envVar) => (
+                        <span
+                          key={envVar}
+                          className="inline-flex items-center rounded-lg bg-white px-2.5 py-1 text-xs font-mono font-medium text-amber-900 border border-amber-200"
+                        >
+                          {envVar}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {runAnalysisData.externalServices.length > 0 && (
+                  <div className="rounded-2xl border border-indigo-200/80 bg-indigo-50/40 p-4">
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-800 mb-1">
+                      External Services ({runAnalysisData.externalServices.length})
+                    </h3>
+                    <p className="text-xs text-indigo-700/90 mb-2.5">
+                      External databases, caches, or backing services detected in manifest or compose configurations.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {runAnalysisData.externalServices.map((svc) => (
+                        <span
+                          key={svc}
+                          className="inline-flex items-center rounded-full bg-white px-3 py-1 text-xs font-semibold text-indigo-800 border border-indigo-200"
+                        >
+                          {svc}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Blockers / Notes if present */}
+            {runAnalysisData.blockers && runAnalysisData.blockers.length > 0 && (
+              <div className="rounded-xl bg-slate-50 border border-slate-200/80 p-3.5 text-xs text-slate-600 flex items-start gap-2.5">
+                <span className="text-slate-500 text-base leading-none">ℹ️</span>
+                <div className="space-y-1">
+                  <p className="font-semibold text-slate-700">Execution Notes</p>
+                  {runAnalysisData.blockers.map((blocker, idx) => (
+                    <p key={idx}>{blocker}</p>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ) : null}
+      </div>
 
       {/* Repository Insights Card */}
       <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">

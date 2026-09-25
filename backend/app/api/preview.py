@@ -162,14 +162,11 @@ async def serve_preview_asset(
         headers = get_github_headers()
 
         async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True, headers=headers) as client:
-            # Fetch git tree to verify existence and avoid 404 probes (cached with analysis_cache)
-            tree_cache_key = f"git_tree_paths:{owner}/{repo}/{branch}"
-
-            async def _load_tree_paths() -> Set[str]:
-                entries = await fetch_git_tree(owner, repo, branch, client)
-                return {entry.get("path", "") for entry in entries if entry.get("type") == "blob"}
-
-            tree_paths = await analysis_cache.get_or_compute_by_key(tree_cache_key, _load_tree_paths)
+            # Fetch git tree to verify existence and avoid 404 probes (cached in github_api_cache)
+            entries = await fetch_git_tree(owner, repo, branch, client)
+            tree_paths: Set[str] = {
+                entry.get("path", "") for entry in entries if entry.get("type") == "blob"
+            }
 
             # Determine repository entry point and whether it is a pre-built SPA
             entry_point = resolve_entry_point(tree_paths)

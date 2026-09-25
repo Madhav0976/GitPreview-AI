@@ -11,21 +11,28 @@ from typing import Dict, Optional, Tuple, Callable, Awaitable, Any
 logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 30 * 60  # 30 minutes
+DEFAULT_GITHUB_CACHE_TTL_SECONDS = 5 * 60  # 5 minutes for upstream GitHub REST API data
 
 
 class AnalysisCache:
     """
     In-memory async-safe TTL cache with in-flight request coalescing.
-    Used for analysis results and static preview assets.
+    Used for analysis results, static preview assets, and shared GitHub REST API responses.
     """
 
-    def __init__(self, ttl_seconds: float = DEFAULT_TTL_SECONDS):
+    def __init__(self, ttl_seconds: float = DEFAULT_TTL_SECONDS, case_sensitive: bool = False):
         self.ttl_seconds = ttl_seconds
+        self.case_sensitive = case_sensitive
         # key -> (payload, expires_at_timestamp)
         self._cache: Dict[str, Tuple[Any, float]] = {}
         # key -> asyncio.Future for in-flight leader-follower coalescing
         self._in_flight: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
+
+    def _format_key(self, key: str) -> str:
+        """Format key according to cache case sensitivity setting."""
+        cleaned = key.strip()
+        return cleaned if self.case_sensitive else cleaned.lower()
 
     @staticmethod
     def normalize_key(owner: str, repo: str) -> str:
@@ -34,7 +41,7 @@ class AnalysisCache:
 
     async def get_by_key(self, key: str) -> Optional[Any]:
         """Get cached value by exact string key if not expired."""
-        normalized_key = key.strip().lower()
+        normalized_key = self._format_key(key)
         async with self._lock:
             entry = self._cache.get(normalized_key)
             if entry:
@@ -46,7 +53,7 @@ class AnalysisCache:
 
     async def set_by_key(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
         """Store value with TTL by exact string key."""
-        normalized_key = key.strip().lower()
+        normalized_key = self._format_key(key)
         ttl_val = ttl if ttl is not None else self.ttl_seconds
         expires_at = time.monotonic() + ttl_val
         async with self._lock:
@@ -63,7 +70,7 @@ class AnalysisCache:
         If multiple coroutines request the same key concurrently, only one runs compute_fn,
         and all others await the result. Errors are never cached.
         """
-        normalized_key = key.strip().lower()
+        normalized_key = self._format_key(key)
 
         async with self._lock:
             entry = self._cache.get(normalized_key)
@@ -136,3 +143,5 @@ class AnalysisCache:
 
 
 analysis_cache = AnalysisCache()
+github_api_cache = AnalysisCache(ttl_seconds=DEFAULT_GITHUB_CACHE_TTL_SECONDS, case_sensitive=True)
+
